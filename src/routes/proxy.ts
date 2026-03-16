@@ -43,21 +43,25 @@ const SERVICE_TARGETS: Record<string, ServiceTarget> = {
   'circleci':      { mode: 'action_proxy', baseUrl: 'https://circleci.com/api/v2' },
 };
 
-// POST /proxy/:service/* - Proxy a request with nonce substitution
-router.all('/:service/*', async (req: Request, res: Response) => {
+// POST /proxy/:service/*path - Proxy a request with nonce substitution
+router.all('/:service/*path', async (req: Request, res: Response) => {
   const service = Array.isArray(req.params.service) ? req.params.service[0] : req.params.service;
   // Everything after /proxy/:service/
-  const rawPath = req.params[0];
+  const rawPath = req.params.path;
   const path = Array.isArray(rawPath) ? rawPath[0] : (rawPath || '');
 
-  // Extract nonce from Authorization header
-  const authHeader = req.headers['x-locksmith-nonce'];
+  // Extract nonce from standard Authorization header — the client thinks
+  // it's sending a real credential. Locksmith swaps it transparently.
+  const authHeader = req.headers.authorization;
   if (!authHeader) {
-    res.status(401).json({ error: 'Missing X-Locksmith-Nonce header' });
+    res.status(401).json({ error: 'Missing Authorization header' });
     return;
   }
 
-  const nonceId = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+  // Accept "Bearer <nonce>" or raw "<nonce>"
+  const nonceId = authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : authHeader;
 
   // Validate the nonce
   const validation = await validateNonce(
