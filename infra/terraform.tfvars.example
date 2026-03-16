@@ -1,0 +1,12 @@
+# Copy to terraform.tfvars and fill in values
+# terraform.tfvars is gitignored — NEVER commit
+
+aws_region      = "us-east-1"
+environment     = "prod"
+entra_tenant_id = "YOUR_TENANT_ID"
+entra_client_id = "YOUR_CLIENT_ID"
+domain          = "locksmith.internal.sonarmd.com"
+
+# nano_3_0 = $5/mo (1 vCPU, 1GB RAM, 2TB transfer)
+# micro_3_0 = $10/mo (1 vCPU, 2GB RAM, 3TB transfer)
+lightsail_instance_size = "nano_3_0"

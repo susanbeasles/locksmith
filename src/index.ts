@@ -1,8 +1,10 @@
-import express from 'express';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import { config } from './config.js';
 import { requireAuth } from './middleware/auth.js';
-import { initRedis } from './services/nonce.js';
 import { initAuditLogger } from './utils/audit.js';
+
+// Import type augmentation so req.identity is recognized
+import './types.js';
 
 // Routes
 import statusRoutes from './routes/status.js';
@@ -12,7 +14,7 @@ import rotateRoutes from './routes/rotate.js';
 import sshRoutes from './routes/ssh.js';
 import tlsRoutes from './routes/tls.js';
 
-const app = express();
+export const app = express();
 app.use(express.json());
 
 // Trust ALB proxy headers
@@ -29,32 +31,31 @@ app.use('/ssh', requireAuth, sshRoutes);
 app.use('/tls', requireAuth, tlsRoutes);
 
 // Global error handler - never leak internal details
-app.use((err, req, res, _next) => {
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error('[ERROR]', err.message);
   res.status(500).json({ error: 'Internal server error' });
 });
 
 // --- Start ---
-async function start() {
+async function start(): Promise<void> {
   await initAuditLogger();
-  initRedis();
 
   app.listen(config.port, () => {
     console.log(`
   ╔═══════════════════════════════════════╗
-  ║         LOCKSMITH v0.1.0              ║
+  ║         LOCKSMITH v0.2.0              ║
   ║   Zero Trust Credential Lifecycle     ║
   ║   Token Substitution Proxy            ║
   ╠═══════════════════════════════════════╣
   ║   Port: ${String(config.port).padEnd(29)}║
   ║   Entra Tenant: ${(config.entra.tenantId || 'NOT SET').substring(0, 20).padEnd(20)}║
-  ║   Redis: ${config.redis.host.padEnd(29)}║
+  ║   DynamoDB: ${config.dynamodb.noncesTable.padEnd(25)}║
   ╚═══════════════════════════════════════╝
     `);
   });
 }
 
-start().catch((err) => {
+start().catch((err: unknown) => {
   console.error('[FATAL]', err);
   process.exit(1);
 });

@@ -1,5 +1,5 @@
 import acme from 'acme-client';
-import { generateKeyPairSync, createPrivateKey } from 'crypto';
+import { createHash } from 'crypto';
 import {
   SecretsManagerClient,
   PutSecretValueCommand,
@@ -12,13 +12,20 @@ import { credentialFingerprint, logAuditEvent } from '../utils/audit.js';
 const smClient = new SecretsManagerClient({ region: config.aws.region });
 
 // Let's Encrypt ACME directories
-const ACME_DIRECTORIES = {
+const ACME_DIRECTORIES: Record<string, string> = {
   production: 'https://acme-v02.api.letsencrypt.org/directory',
   staging: 'https://acme-staging-v02.api.letsencrypt.org/directory',
 };
 
+interface CertConfig {
+  domains: string[];
+  acmeEnv: string;
+  secretId: string;
+  dnsProvider: string;
+}
+
 // Environment-specific cert configurations
-const CERT_CONFIGS = {
+const CERT_CONFIGS: Record<string, CertConfig> = {
   prod: {
     domains: ['sonarmd.com', '*.sonarmd.com'],
     acmeEnv: 'production',
@@ -39,8 +46,85 @@ const CERT_CONFIGS = {
   },
 };
 
+interface CertBundle {
+  certificate: string;
+  privateKey: string;
+  domains: string[];
+  environment: string;
+  issuedAt: string;
+  expiresAt: string;
+  issuer: string;
+  acmArn?: Record<string, string>;
+}
+
+interface CertInfo {
+  expiresAt: string;
+  daysRemaining: number;
+  fingerprint: string | null;
+}
+
+interface IssueCertParams {
+  environment: string;
+  forceRenew?: boolean;
+  triggeredBy: string;
+}
+
+interface IssueCertResult {
+  status: string;
+  message?: string;
+  environment?: string;
+  domains?: string[];
+  issuedAt?: string;
+  expiresAt?: string;
+  daysRemaining?: number;
+  fingerprint?: string | null;
+  secretId?: string;
+}
+
+interface PushToAcmParams {
+  environment: string;
+  region?: string;
+}
+
+interface PushToAcmResult {
+  acmArn: string;
+  region: string;
+  environment: string;
+}
+
+interface PushToServersParams {
+  environment: string;
+  instanceIds: string[];
+  certPath?: string;
+  keyPath?: string;
+}
+
+interface PushToServersResult {
+  commandId: string;
+  instanceIds: string[];
+  environment: string;
+  message: string;
+}
+
+interface CertStatusResult {
+  environment: string;
+  status: string;
+  domains?: string[];
+  issuedAt?: string;
+  expiresAt?: string;
+  daysRemaining?: number;
+  issuer?: string;
+  fingerprint?: string | null;
+  acmArns?: Record<string, string>;
+  error?: string;
+}
+
 // Issue or renew a wildcard certificate via Let's Encrypt
-export async function issueCertificate({ environment, forceRenew = false, triggeredBy }) {
+export async function issueCertificate({
+  environment,
+  forceRenew = false,
+  triggeredBy,
+}: IssueCertParams): Promise<IssueCertResult> {
   const certConfig = CERT_CONFIGS[environment];
   if (!certConfig) {
     throw new Error(`Unknown environment: ${environment}. Available: ${Object.keys(CERT_CONFIGS).join(', ')}`);
@@ -79,7 +163,7 @@ export async function issueCertificate({ environment, forceRenew = false, trigge
   // Step 3: Register account (idempotent)
   await client.createAccount({
     termsOfServiceAgreed: true,
-    contact: [`mailto:engineering@sonarmd.com`],
+    contact: ['mailto:engineering@sonarmd.com'],
   });
 
   // Step 4: Generate CSR private key (this is the cert's private key)
@@ -109,7 +193,7 @@ export async function issueCertificate({ environment, forceRenew = false, trigge
       // Wait for DNS propagation
       await sleep(15000);
     },
-    challengeRemoveFn: async (authz, challenge, keyAuthorization) => {
+    challengeRemoveFn: async (authz, challenge, _keyAuthorization) => {
       if (challenge.type !== 'dns-01') return;
 
       const dnsRecord = `_acme-challenge.${authz.identifier.value}`;
@@ -126,7 +210,7 @@ export async function issueCertificate({ environment, forceRenew = false, trigge
   });
 
   // Step 6: Store cert + key in Secrets Manager
-  const certBundle = {
+  const certBundle: CertBundle = {
     certificate: cert.toString(),
     privateKey: certKey.toString(),
     domains: certConfig.domains,
@@ -160,7 +244,10 @@ export async function issueCertificate({ environment, forceRenew = false, trigge
 }
 
 // Push certificate to ACM for ALB/CloudFront/API Gateway
-export async function pushToAcm({ environment, region }) {
+export async function pushToAcm({
+  environment,
+  region,
+}: PushToAcmParams): Promise<PushToAcmResult> {
   const certConfig = CERT_CONFIGS[environment];
   if (!certConfig) throw new Error(`Unknown environment: ${environment}`);
 
@@ -176,25 +263,18 @@ export async function pushToAcm({ environment, region }) {
   // Split certificate chain (cert + intermediates)
   const certParts = splitCertChain(certBundle.certificate);
 
-  const params = {
+  const importInput = {
     Certificate: Buffer.from(certParts.leaf),
     PrivateKey: Buffer.from(certBundle.privateKey),
+    ...(certParts.chain ? { CertificateChain: Buffer.from(certParts.chain) } : {}),
+    ...(certBundle.acmArn?.[targetRegion] ? { CertificateArn: certBundle.acmArn[targetRegion] } : {}),
   };
 
-  if (certParts.chain) {
-    params.CertificateChain = Buffer.from(certParts.chain);
-  }
-
-  // If we have an existing ACM ARN, reimport to the same ARN
-  if (certBundle.acmArn && certBundle.acmArn[targetRegion]) {
-    params.CertificateArn = certBundle.acmArn[targetRegion];
-  }
-
-  const result = await acmClient.send(new ImportCertificateCommand(params));
+  const result = await acmClient.send(new ImportCertificateCommand(importInput));
 
   // Store the ACM ARN back in the cert bundle for future reimports
   certBundle.acmArn = certBundle.acmArn || {};
-  certBundle.acmArn[targetRegion] = result.CertificateArn;
+  certBundle.acmArn[targetRegion] = result.CertificateArn!;
   await storeCertInSecretsManager(certConfig.secretId, certBundle);
 
   logAuditEvent({
@@ -205,14 +285,19 @@ export async function pushToAcm({ environment, region }) {
   });
 
   return {
-    acmArn: result.CertificateArn,
+    acmArn: result.CertificateArn!,
     region: targetRegion,
     environment,
   };
 }
 
 // Push certificate to servers via SSM Run Command
-export async function pushToServers({ environment, instanceIds, certPath, keyPath }) {
+export async function pushToServers({
+  environment,
+  instanceIds,
+  certPath,
+  keyPath,
+}: PushToServersParams): Promise<PushToServersResult> {
   const certConfig = CERT_CONFIGS[environment];
   if (!certConfig) throw new Error(`Unknown environment: ${environment}`);
 
@@ -253,11 +338,11 @@ export async function pushToServers({ environment, instanceIds, certPath, keyPat
     environment,
     instance_count: instanceIds.length,
     instance_ids: instanceIds,
-    command_id: result.Command.CommandId,
+    command_id: result.Command?.CommandId,
   });
 
   return {
-    commandId: result.Command.CommandId,
+    commandId: result.Command?.CommandId ?? '',
     instanceIds,
     environment,
     message: `Certificate push initiated to ${instanceIds.length} instances. Check SSM command status for results.`,
@@ -265,7 +350,7 @@ export async function pushToServers({ environment, instanceIds, certPath, keyPat
 }
 
 // Get certificate status for an environment
-export async function getCertStatus(environment) {
+export async function getCertStatus(environment: string): Promise<CertStatusResult> {
   const certConfig = CERT_CONFIGS[environment];
   if (!certConfig) throw new Error(`Unknown environment: ${environment}`);
 
@@ -280,7 +365,7 @@ export async function getCertStatus(environment) {
 
   const expiresAt = new Date(certBundle.expiresAt);
   const now = new Date();
-  const daysRemaining = Math.floor((expiresAt - now) / (24 * 60 * 60 * 1000));
+  const daysRemaining = Math.floor((expiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
 
   let status = 'valid';
   if (daysRemaining <= 0) status = 'expired';
@@ -300,13 +385,14 @@ export async function getCertStatus(environment) {
 }
 
 // Get status for all environments
-export async function getAllCertStatus() {
-  const results = {};
+export async function getAllCertStatus(): Promise<Record<string, CertStatusResult>> {
+  const results: Record<string, CertStatusResult> = {};
   for (const env of Object.keys(CERT_CONFIGS)) {
     try {
       results[env] = await getCertStatus(env);
     } catch (err) {
-      results[env] = { environment: env, status: 'error', error: err.message };
+      const message = err instanceof Error ? err.message : String(err);
+      results[env] = { environment: env, status: 'error', error: message };
     }
   }
   return results;
@@ -314,7 +400,7 @@ export async function getAllCertStatus() {
 
 // --- Cloudflare DNS helpers ---
 
-async function createDnsRecord(provider, name, value) {
+async function createDnsRecord(provider: string, name: string, value: string): Promise<string> {
   if (provider !== 'cloudflare') {
     throw new Error(`DNS provider ${provider} not implemented. Only cloudflare is supported.`);
   }
@@ -341,7 +427,7 @@ async function createDnsRecord(provider, name, value) {
     }),
   });
 
-  const data = await res.json();
+  const data = await res.json() as { success: boolean; errors: unknown[]; result: { id: string } };
   if (!data.success) {
     throw new Error(`Cloudflare DNS record creation failed: ${JSON.stringify(data.errors)}`);
   }
@@ -349,7 +435,7 @@ async function createDnsRecord(provider, name, value) {
   return data.result.id;
 }
 
-async function removeDnsRecord(provider, name) {
+async function removeDnsRecord(provider: string, name: string): Promise<void> {
   if (provider !== 'cloudflare') return;
 
   const cfApiToken = process.env.CLOUDFLARE_API_TOKEN;
@@ -361,7 +447,7 @@ async function removeDnsRecord(provider, name) {
     `https://api.cloudflare.com/client/v4/zones/${cfZoneId}/dns_records?type=TXT&name=${name}`,
     { headers: { Authorization: `Bearer ${cfApiToken}` } }
   );
-  const listData = await listRes.json();
+  const listData = await listRes.json() as { result?: Array<{ id: string }> };
 
   // Delete all matching records
   for (const record of listData.result || []) {
@@ -374,17 +460,32 @@ async function removeDnsRecord(provider, name) {
 
 // --- Secrets Manager helpers ---
 
-async function getCertBundle(secretId) {
+async function getCurrentCert(secretId: string): Promise<CertInfo | null> {
+  const bundle = await getCertBundle(secretId);
+  if (!bundle) return null;
+
+  const expiresAt = new Date(bundle.expiresAt);
+  const now = new Date();
+  const daysRemaining = Math.floor((expiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000));
+
+  return {
+    expiresAt: bundle.expiresAt,
+    daysRemaining,
+    fingerprint: credentialFingerprint(bundle.certificate),
+  };
+}
+
+async function getCertBundle(secretId: string): Promise<CertBundle | null> {
   try {
     const response = await smClient.send(new GetSecretValueCommand({ SecretId: secretId }));
-    return JSON.parse(response.SecretString);
-  } catch (err) {
-    if (err.name === 'ResourceNotFoundException') return null;
+    return JSON.parse(response.SecretString!) as CertBundle;
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === 'ResourceNotFoundException') return null;
     throw err;
   }
 }
 
-async function storeCertInSecretsManager(secretId, bundle) {
+async function storeCertInSecretsManager(secretId: string, bundle: CertBundle): Promise<void> {
   const secretString = JSON.stringify(bundle);
 
   try {
@@ -392,8 +493,8 @@ async function storeCertInSecretsManager(secretId, bundle) {
       SecretId: secretId,
       SecretString: secretString,
     }));
-  } catch (err) {
-    if (err.name === 'ResourceNotFoundException') {
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === 'ResourceNotFoundException') {
       // Secret doesn't exist yet, create it
       await smClient.send(new CreateSecretCommand({
         Name: secretId,
@@ -410,14 +511,14 @@ async function storeCertInSecretsManager(secretId, bundle) {
   }
 }
 
-async function getOrCreateAccountKey() {
+async function getOrCreateAccountKey(): Promise<string> {
   const secretId = 'locksmith/acme/account-key';
 
   try {
     const response = await smClient.send(new GetSecretValueCommand({ SecretId: secretId }));
-    return response.SecretString;
-  } catch (err) {
-    if (err.name === 'ResourceNotFoundException') {
+    return response.SecretString!;
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === 'ResourceNotFoundException') {
       // Generate new ACME account key
       const accountKey = await acme.crypto.createPrivateKey();
       const keyString = accountKey.toString();
@@ -435,11 +536,11 @@ async function getOrCreateAccountKey() {
   }
 }
 
-function needsRenewal(certInfo) {
+function needsRenewal(certInfo: CertInfo): boolean {
   return certInfo.daysRemaining <= 30;
 }
 
-function splitCertChain(fullChain) {
+function splitCertChain(fullChain: string): { leaf: string; chain: string | null } {
   const certs = fullChain.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
   if (!certs || certs.length === 0) {
     throw new Error('No certificates found in chain');
@@ -451,6 +552,6 @@ function splitCertChain(fullChain) {
   };
 }
 
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }

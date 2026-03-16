@@ -3,3 +3,12 @@ node_modules/
 !.env.example
 *.log
 /var/
+
+# Terraform
+infra/.terraform/
+infra/*.tfstate*
+infra/.terraform.lock.hcl
+infra/terraform.tfvars
+
+# Build artifacts
+dist/

@@ -1,4 +1,4 @@
-import { generateKeyPairSync, createSign, randomBytes } from 'crypto';
+import { randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { writeFileSync, unlinkSync, readFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -13,13 +13,47 @@ const MAX_VALIDITY_SECONDS = 24 * 60 * 60;    // 24 hours hard cap
 
 // Principal mappings - which users can request certs for which principals
 // In production, this comes from policy config
-const PRINCIPAL_POLICY = {
+const PRINCIPAL_POLICY: Record<string, string[]> = {
   // Entra OID -> allowed SSH principals
   // '*' means any authenticated user can request these principals
   '*': ['deploy', 'ubuntu', 'ec2-user'],
   // Specific user overrides (add Entra OIDs here)
   // 'oid-for-tony': ['root', 'deploy', 'ubuntu', 'ec2-user', 'admin'],
 };
+
+interface IssueCertificateParams {
+  userId: string;
+  principals?: string[];
+  validitySeconds?: number;
+  keyId?: string;
+  extensions?: string[];
+  triggeredBy?: string;
+}
+
+interface IssueCertificateResult {
+  certificate: string;
+  privateKey: string;
+  publicKey: string;
+  keyId: string;
+  principals: string[];
+  validitySeconds: number;
+  expiresAt: string;
+  usage: {
+    addToAgent: string;
+    sshCommand: string;
+  };
+}
+
+interface RotateCaKeyParams {
+  triggeredBy: string;
+}
+
+interface RotateCaKeyResult {
+  privateKey: string;
+  publicKey: string;
+  fingerprint: string | null;
+  instructions: string[];
+}
 
 // Issue a short-lived SSH certificate
 export async function issueCertificate({
@@ -29,7 +63,7 @@ export async function issueCertificate({
   keyId,
   extensions,
   triggeredBy,
-}) {
+}: IssueCertificateParams): Promise<IssueCertificateResult> {
   // Enforce max validity
   if (validitySeconds > MAX_VALIDITY_SECONDS) {
     throw new Error(`Validity cannot exceed ${MAX_VALIDITY_SECONDS}s (${MAX_VALIDITY_SECONDS / 3600}h)`);
@@ -60,7 +94,7 @@ export async function issueCertificate({
 
     // Step 2: Retrieve CA private key from credential store
     // The CA key NEVER leaves this function's scope
-    const caCredential = await resolveCredential('ssh-ca');
+    const caCredential = await resolveCredential('ssh-ca') as Record<string, string>;
     const caPrivateKey = caCredential.private_key || caCredential.password || caCredential.value;
 
     if (!caPrivateKey) {
@@ -76,7 +110,7 @@ export async function issueCertificate({
     const validitySpec = `+${validitySeconds}s`;
 
     // Build ssh-keygen sign command
-    const signCmd = [
+    const signCmd: string[] = [
       'ssh-keygen',
       '-s', caKeyPath,                    // CA private key
       '-I', certKeyId,                    // Key identity (shows in logs)
@@ -164,8 +198,8 @@ export async function issueCertificate({
 }
 
 // Get CA public key (safe to distribute to hosts)
-export async function getCaPublicKey() {
-  const caCredential = await resolveCredential('ssh-ca');
+export async function getCaPublicKey(): Promise<string> {
+  const caCredential = await resolveCredential('ssh-ca') as Record<string, string>;
   const publicKey = caCredential.public_key;
 
   if (!publicKey) {
@@ -176,7 +210,7 @@ export async function getCaPublicKey() {
 }
 
 // Check what principals a user is allowed to request
-function getAllowedPrincipals(userId) {
+function getAllowedPrincipals(userId: string): string[] {
   // Check user-specific policy first
   if (PRINCIPAL_POLICY[userId]) {
     return PRINCIPAL_POLICY[userId];
@@ -187,7 +221,9 @@ function getAllowedPrincipals(userId) {
 }
 
 // Rotate the CA key itself (very sensitive operation)
-export async function rotateCaKey({ triggeredBy }) {
+export async function rotateCaKey({
+  triggeredBy,
+}: RotateCaKeyParams): Promise<RotateCaKeyResult> {
   logAuditEvent({
     event_type: 'ssh_ca_rotation_started',
     triggered_by: triggeredBy,

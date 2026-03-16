@@ -3,11 +3,13 @@ import {
   CreateAccessKeyCommand,
   DeleteAccessKeyCommand,
   ListAccessKeysCommand,
-  GetUserCommand,
+  type AccessKeyMetadata,
 } from '@aws-sdk/client-iam';
 import {
   STSClient,
   AssumeRoleCommand,
+  GetCallerIdentityCommand,
+  type AssumeRoleCommandInput,
 } from '@aws-sdk/client-sts';
 import { config } from '../config.js';
 import { credentialFingerprint, logAuditEvent } from '../utils/audit.js';
@@ -15,10 +17,42 @@ import { credentialFingerprint, logAuditEvent } from '../utils/audit.js';
 const iam = new IAMClient({ region: config.aws.region });
 const sts = new STSClient({ region: config.aws.region });
 
+interface VendAwsSessionParams {
+  roleArn: string;
+  sessionName?: string;
+  durationSeconds?: number;
+  policy?: Record<string, unknown>;
+}
+
+interface VendAwsSessionResult {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken: string;
+  expiration: Date;
+}
+
+interface RotateAccessKeysParams {
+  userName: string;
+  triggeredBy: string;
+}
+
+interface RotateAccessKeysResult {
+  success: boolean;
+  service: string;
+  target: string;
+  newKeyFingerprint: string | null;
+  revokedKeys: number;
+}
+
 // Vend a short-lived STS session for a proxy request
 // This is Mode A: token vending for services that support derived credentials
-export async function vendAwsSession({ roleArn, sessionName, durationSeconds = 900, policy }) {
-  const params = {
+export async function vendAwsSession({
+  roleArn,
+  sessionName,
+  durationSeconds = 900,
+  policy,
+}: VendAwsSessionParams): Promise<VendAwsSessionResult> {
+  const params: AssumeRoleCommandInput = {
     RoleArn: roleArn,
     RoleSessionName: sessionName || `locksmith-${Date.now()}`,
     DurationSeconds: durationSeconds,
@@ -31,17 +65,24 @@ export async function vendAwsSession({ roleArn, sessionName, durationSeconds = 9
 
   const response = await sts.send(new AssumeRoleCommand(params));
 
+  if (!response.Credentials) {
+    throw new Error('STS AssumeRole returned no credentials');
+  }
+
   return {
-    accessKeyId: response.Credentials.AccessKeyId,
-    secretAccessKey: response.Credentials.SecretAccessKey,
-    sessionToken: response.Credentials.SessionToken,
-    expiration: response.Credentials.Expiration,
+    accessKeyId: response.Credentials.AccessKeyId!,
+    secretAccessKey: response.Credentials.SecretAccessKey!,
+    sessionToken: response.Credentials.SessionToken!,
+    expiration: response.Credentials.Expiration!,
   };
 }
 
 // Rotate IAM access keys for a user
 // Full lifecycle: create new -> verify -> delete old
-export async function rotateAccessKeys({ userName, triggeredBy }) {
+export async function rotateAccessKeys({
+  userName,
+  triggeredBy,
+}: RotateAccessKeysParams): Promise<RotateAccessKeysResult> {
   logAuditEvent({
     event_type: 'rotation_started',
     service: 'aws-iam',
@@ -54,13 +95,16 @@ export async function rotateAccessKeys({ userName, triggeredBy }) {
     new ListAccessKeysCommand({ UserName: userName })
   );
 
-  const activeKeys = existingKeys.AccessKeyMetadata.filter(k => k.Status === 'Active');
+  const activeKeys = (existingKeys.AccessKeyMetadata ?? []).filter(
+    (k: AccessKeyMetadata) => k.Status === 'Active'
+  );
 
   // AWS allows max 2 access keys per user
   // If there are already 2, we need to delete the oldest one first
   if (activeKeys.length >= 2) {
     const oldest = activeKeys.sort(
-      (a, b) => new Date(a.CreateDate) - new Date(b.CreateDate)
+      (a: AccessKeyMetadata, b: AccessKeyMetadata) =>
+        (a.CreateDate?.getTime() ?? 0) - (b.CreateDate?.getTime() ?? 0)
     )[0];
 
     await iam.send(
@@ -74,7 +118,7 @@ export async function rotateAccessKeys({ userName, triggeredBy }) {
       event_type: 'rotation_deleted_excess_key',
       service: 'aws-iam',
       target: userName,
-      old_key_fingerprint: credentialFingerprint(oldest.AccessKeyId),
+      old_key_fingerprint: credentialFingerprint(oldest.AccessKeyId ?? ''),
     });
   }
 
@@ -83,8 +127,12 @@ export async function rotateAccessKeys({ userName, triggeredBy }) {
     new CreateAccessKeyCommand({ UserName: userName })
   );
 
-  const newAccessKeyId = newKey.AccessKey.AccessKeyId;
-  const newSecretKey = newKey.AccessKey.SecretAccessKey;
+  if (!newKey.AccessKey) {
+    throw new Error('CreateAccessKey returned no key');
+  }
+
+  const newAccessKeyId = newKey.AccessKey.AccessKeyId!;
+  const newSecretKey = newKey.AccessKey.SecretAccessKey!;
 
   logAuditEvent({
     event_type: 'rotation_key_created',
@@ -107,23 +155,27 @@ export async function rotateAccessKeys({ userName, triggeredBy }) {
     // New IAM keys can take a few seconds to propagate
     await new Promise(resolve => setTimeout(resolve, 5000));
 
-    const { default: { GetCallerIdentityCommand } } = await import('@aws-sdk/client-sts');
     await verifySts.send(new GetCallerIdentityCommand({}));
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+
     logAuditEvent({
       event_type: 'rotation_verification_failed',
       service: 'aws-iam',
       target: userName,
       new_key_fingerprint: credentialFingerprint(newAccessKeyId),
-      error: err.message,
+      error: message,
     });
 
     // Don't revoke old key - new one didn't verify
-    throw new Error(`New access key verification failed: ${err.message}. Old key NOT revoked.`);
+    throw new Error(`New access key verification failed: ${message}. Old key NOT revoked.`);
   }
 
   // Step 4: Delete remaining old keys (any active keys that aren't the new one)
-  const remainingOldKeys = activeKeys.filter(k => k.AccessKeyId !== newAccessKeyId);
+  const remainingOldKeys = activeKeys.filter(
+    (k: AccessKeyMetadata) => k.AccessKeyId !== newAccessKeyId
+  );
+
   for (const oldKey of remainingOldKeys) {
     try {
       await iam.send(
@@ -137,15 +189,17 @@ export async function rotateAccessKeys({ userName, triggeredBy }) {
         event_type: 'rotation_old_key_revoked',
         service: 'aws-iam',
         target: userName,
-        old_key_fingerprint: credentialFingerprint(oldKey.AccessKeyId),
+        old_key_fingerprint: credentialFingerprint(oldKey.AccessKeyId ?? ''),
       });
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+
       logAuditEvent({
         event_type: 'rotation_revoke_failed',
         service: 'aws-iam',
         target: userName,
-        old_key_fingerprint: credentialFingerprint(oldKey.AccessKeyId),
-        error: err.message,
+        old_key_fingerprint: credentialFingerprint(oldKey.AccessKeyId ?? ''),
+        error: message,
       });
       // Don't throw - new key is working, old key revocation failure is not critical
     }

@@ -1,13 +1,38 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { validateNonce } from '../services/nonce.js';
 import { resolveCredential } from '../services/credentials.js';
 import { vendAwsSession } from '../plugins/aws.js';
 import { logAuditEvent } from '../utils/audit.js';
 
+interface Credential {
+  token?: string;
+  password?: string;
+  access_token?: string;
+  roleArn?: string;
+  RoleArn?: string;
+}
+
+interface ProxyResult {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+interface TokenVendTarget {
+  mode: 'token_vend';
+  handler: (req: Request, service: string, path: string) => Promise<ProxyResult>;
+}
+
+interface ActionProxyTarget {
+  mode: 'action_proxy';
+  baseUrl: string;
+}
+
+type ServiceTarget = TokenVendTarget | ActionProxyTarget;
+
 const router = Router();
 
 // Service-specific target URL mapping
-const SERVICE_TARGETS = {
+const SERVICE_TARGETS: Record<string, ServiceTarget> = {
   'aws-prod':      { mode: 'token_vend', handler: proxyAws },
   'aws-dev':       { mode: 'token_vend', handler: proxyAws },
   'github':        { mode: 'action_proxy', baseUrl: 'https://api.github.com' },
@@ -19,32 +44,27 @@ const SERVICE_TARGETS = {
 };
 
 // POST /proxy/:service/* - Proxy a request with nonce substitution
-router.all('/:service/*', async (req, res) => {
-  const { service } = req.params;
+router.all('/:service/*', async (req: Request, res: Response) => {
+  const service = Array.isArray(req.params.service) ? req.params.service[0] : req.params.service;
   // Everything after /proxy/:service/
-  const path = req.params[0] || '';
+  const rawPath = req.params[0];
+  const path = Array.isArray(rawPath) ? rawPath[0] : (rawPath || '');
 
   // Extract nonce from Authorization header
   const authHeader = req.headers['x-locksmith-nonce'];
   if (!authHeader) {
-    return res.status(401).json({ error: 'Missing X-Locksmith-Nonce header' });
+    res.status(401).json({ error: 'Missing X-Locksmith-Nonce header' });
+    return;
   }
 
-  const nonceId = authHeader;
-
-  // Determine the action from the request for scope validation
-  const requestedAction = {
-    method: req.method,
-    path: `/${path}`,
-    service,
-  };
+  const nonceId = Array.isArray(authHeader) ? authHeader[0] : authHeader;
 
   // Validate the nonce
   const validation = await validateNonce(
     nonceId,
     req.identity.oid,
     service,
-    requestedAction
+    { method: req.method, path: `/${path}`, service },
   );
 
   if (!validation.valid) {
@@ -56,18 +76,20 @@ router.all('/:service/*', async (req, res) => {
       reason: validation.reason,
       nonce_id: nonceId,
     });
-    return res.status(403).json({ error: validation.reason });
+    res.status(403).json({ error: validation.reason });
+    return;
   }
 
   const target = SERVICE_TARGETS[service];
   if (!target) {
-    return res.status(404).json({ error: `Unknown service: ${service}` });
+    res.status(404).json({ error: `Unknown service: ${service}` });
+    return;
   }
 
   try {
-    let result;
+    let result: ProxyResult;
 
-    if (target.mode === 'token_vend' && target.handler) {
+    if (target.mode === 'token_vend') {
       // Mode A: Token vending (AWS)
       result = await target.handler(req, service, path);
     } else {
@@ -82,12 +104,13 @@ router.all('/:service/*', async (req, res) => {
       method: req.method,
       path,
       nonce_id: nonceId,
-      nonce_type: validation.nonce.type,
+      nonce_type: validation.nonce?.type,
       result: 'success',
     });
 
     res.status(result.status || 200).json(result.body);
   } catch (err) {
+    const errMessage = err instanceof Error ? err.message : String(err);
     logAuditEvent({
       event_type: 'proxy_error',
       user: req.identity.oid,
@@ -95,18 +118,18 @@ router.all('/:service/*', async (req, res) => {
       method: req.method,
       path,
       nonce_id: nonceId,
-      error: err.message,
+      error: errMessage,
     });
 
-    res.status(502).json({ error: `Proxy error: ${err.message}` });
+    res.status(502).json({ error: `Proxy error: ${errMessage}` });
   }
 });
 
 // Mode A: AWS token vending
 // Instead of proxying the request, we vend a short-lived STS session
 // The client gets temporary AWS credentials scoped to their declared scope
-async function proxyAws(req, service) {
-  const credential = await resolveCredential(service);
+async function proxyAws(req: Request, service: string): Promise<ProxyResult> {
+  const credential = await resolveCredential(service) as Credential;
 
   // The resolved credential should contain the role ARN to assume
   const roleArn = credential.roleArn || credential.RoleArn;
@@ -132,15 +155,20 @@ async function proxyAws(req, service) {
       secretAccessKey: session.secretAccessKey,
       sessionToken: session.sessionToken,
       expiration: session.expiration,
-      region: req.body.region || 'us-east-1',
+      region: (req.body as Record<string, string>)?.region || 'us-east-1',
     },
   };
 }
 
 // Mode B: Action proxy
 // The client never gets ANY credential. We forward the request with the real token.
-async function actionProxy(req, service, path, baseUrl) {
-  const credential = await resolveCredential(service);
+async function actionProxy(
+  req: Request,
+  service: string,
+  path: string,
+  baseUrl: string,
+): Promise<ProxyResult> {
+  const credential = await resolveCredential(service) as Credential;
 
   // Build the target URL
   const targetUrl = `${baseUrl}/${path}`;
@@ -149,7 +177,7 @@ async function actionProxy(req, service, path, baseUrl) {
   const headers = buildServiceHeaders(service, credential, req);
 
   // Forward the request
-  const fetchOptions = {
+  const fetchOptions: RequestInit = {
     method: req.method,
     headers,
   };
@@ -161,9 +189,9 @@ async function actionProxy(req, service, path, baseUrl) {
   }
 
   const response = await fetch(targetUrl, fetchOptions);
-  let body;
+  let body: Record<string, unknown>;
   try {
-    body = await response.json();
+    body = await response.json() as Record<string, unknown>;
   } catch {
     body = { raw: await response.text() };
   }
@@ -172,9 +200,13 @@ async function actionProxy(req, service, path, baseUrl) {
 }
 
 // Build service-specific auth headers
-function buildServiceHeaders(service, credential, req) {
-  const headers = {
-    'User-Agent': 'Locksmith-Proxy/0.1.0',
+function buildServiceHeaders(
+  service: string,
+  credential: Credential,
+  _req: Request,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    'User-Agent': 'Locksmith-Proxy/0.2.0',
   };
 
   switch (service) {
@@ -203,7 +235,7 @@ function buildServiceHeaders(service, credential, req) {
       break;
 
     case 'circleci':
-      headers['Circle-Token'] = credential.token || credential.password;
+      headers['Circle-Token'] = credential.token || credential.password || '';
       break;
 
     default:
