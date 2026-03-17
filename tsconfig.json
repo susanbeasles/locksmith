@@ -15,5 +15,5 @@
     "sourceMap": true
   },
   "include": ["src/**/*.ts", "lambda.ts"],
-  "exclude": ["node_modules", "dist", "infra"]
+  "exclude": ["node_modules", "dist", "infra", "src/**/*.test.ts"]
 }

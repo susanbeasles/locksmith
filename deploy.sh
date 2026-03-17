@@ -43,6 +43,15 @@ preflight() {
   ok "AWS authenticated"
 }
 
+# --- Compile TypeScript ---
+build_typescript() {
+  bold "Compiling TypeScript"
+
+  cd "${SCRIPT_DIR}"
+  npx tsc
+  ok "TypeScript compiled to dist/build/"
+}
+
 # --- Build Lambda package ---
 build_lambda() {
   bold "Building Lambda package"
@@ -54,12 +63,14 @@ build_lambda() {
   rm -rf "${build_dir}"
   mkdir -p "${build_dir}"
 
-  # Copy source
-  cp -r "${SCRIPT_DIR}/src" "${build_dir}/src"
-  cp "${SCRIPT_DIR}/package.json" "${build_dir}/"
-  cp "${SCRIPT_DIR}/lambda.js" "${build_dir}/" 2>/dev/null || {
-    info "lambda.js not found — will need Lambda adapter"
+  # Copy compiled JS output (tsc outputs to dist/build/)
+  cp -r "${DIST_DIR}/build/src" "${build_dir}/src"
+  cp "${DIST_DIR}/build/lambda.js" "${build_dir}/" 2>/dev/null || {
+    bad "lambda.js not found in build output — check tsconfig.json"
+    exit 1
   }
+  cp "${DIST_DIR}/build/lambda.js.map" "${build_dir}/" 2>/dev/null || true
+  cp "${SCRIPT_DIR}/package.json" "${build_dir}/"
 
   # Install production deps only
   cd "${build_dir}"
@@ -68,7 +79,7 @@ build_lambda() {
 
   # Zip it
   cd "${build_dir}"
-  zip -r "${DIST_DIR}/lambda.zip" . -x "*.git*" >/dev/null
+  zip -r "${DIST_DIR}/lambda.zip" . -x "*.git*" "*.d.ts" "*.d.ts.map" >/dev/null
   ok "Lambda package: $(du -h "${DIST_DIR}/lambda.zip" | cut -f1)"
 
   # Cleanup
@@ -119,17 +130,18 @@ deploy_lightsail() {
 
   info "Instance: ${instance_name} (${lightsail_ip})"
 
-  # Sync code to Lightsail via SSH
+  # Sync compiled JS output + package.json to Lightsail
   rsync -az --delete \
-    --exclude node_modules \
-    --exclude .git \
-    --exclude dist \
-    --exclude infra \
     -e "ssh -o StrictHostKeyChecking=accept-new" \
-    "${SCRIPT_DIR}/" \
+    "${DIST_DIR}/build/src/" \
+    "ec2-user@${lightsail_ip}:/opt/locksmith/src/"
+
+  rsync -az \
+    -e "ssh -o StrictHostKeyChecking=accept-new" \
+    "${SCRIPT_DIR}/package.json" "${SCRIPT_DIR}/package-lock.json" \
     "ec2-user@${lightsail_ip}:/opt/locksmith/"
 
-  ok "Code synced"
+  ok "Compiled JS synced"
 
   # Install deps and restart on remote
   ssh "ec2-user@${lightsail_ip}" << 'REMOTE'
@@ -181,10 +193,12 @@ preflight
 
 case "${ACTION}" in
   plan)
+    build_typescript
     build_lambda
     terraform_action plan
     ;;
   apply)
+    build_typescript
     build_lambda
     terraform_action apply
     deploy_lambda
