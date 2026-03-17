@@ -55,7 +55,10 @@ async function start(): Promise<void> {
   });
 }
 
-start().catch((err: unknown) => {
-  console.error('[FATAL]', err);
-  process.exit(1);
-});
+// Only start the HTTP server when running standalone (not in Lambda)
+if (!process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  start().catch((err: unknown) => {
+    console.error('[FATAL]', err);
+    process.exit(1);
+  });
+}

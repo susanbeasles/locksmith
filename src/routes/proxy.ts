@@ -4,7 +4,7 @@ import { resolveCredential } from '../services/credentials.js';
 import { vendAwsSession } from '../plugins/aws.js';
 import { logAuditEvent } from '../utils/audit.js';
 
-interface Credential {
+export interface Credential {
   token?: string;
   password?: string;
   access_token?: string;
@@ -204,7 +204,7 @@ async function actionProxy(
 }
 
 // Build service-specific auth headers
-function buildServiceHeaders(
+export function buildServiceHeaders(
   service: string,
   credential: Credential,
   _req: Request,
