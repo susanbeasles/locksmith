@@ -1,0 +1,32 @@
+node_modules/
+.env*
+!.env.example
+*.log
+/var/
+
+# Terraform
+infra/.terraform/
+infra/*.tfstate*
+infra/.terraform.lock.hcl
+infra/terraform.tfvars
+
+# Build artifacts
+dist/
+
+
+.guard/logs/
+
+
+.agent-guard/policy.local.json
+
+
+.agent-guard/UNLOCK-*
+
+
+.agent-guard/__pycache__/
+
+
+.guard/hooks/__pycache__/
+
+
+.claude/settings.local.json
