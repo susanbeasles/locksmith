@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/anvil-core",
+    "crates/anvil-cache",
 ]
 
 [workspace.package]
