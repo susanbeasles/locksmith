@@ -1,0 +1,21 @@
+# Rust / Cargo build outputs
+/target/
+**/*.rs.bk
+*.pdb
+
+# Coverage & profiling artifacts
+*.profraw
+*.profdata
+lcov.info
+
+# Local sockets, ephemeral test artifacts, and OS metadata
+*.sock
+.DS_Store
+
+# Never permit local secret or environment files in version control
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
