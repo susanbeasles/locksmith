@@ -946,6 +946,12 @@ fn redteam_forge_controller_rejects_injection_floating_tags_and_traversal() {
             && ci_src.contains("file: infra/Dockerfile"),
         "ci-and-sign.yml must enforce MSRV 1.85.1 and PR/branch Dockerfile build+verify gates"
     );
+    assert!(
+        !ci_src.contains("apt-get")
+            && !ci_src.contains("sudo apt")
+            && !ci_src.contains("-fuse-ld=mold"),
+        "ci-and-sign.yml must never run apt-get or require unprovisioned mold on standard runners"
+    );
 
     let agents_src = std::fs::read_to_string(workspace_root.join("AGENTS.md")).unwrap();
     assert!(

@@ -28,11 +28,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install build and audit dependencies (clang, cmake, mold, shellcheck, binutils)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends binutils clang cmake mold pkg-config shellcheck
-
       - name: Install pinned Rust 1.99.1 toolchain and MSRV 1.85.1 toolchain
         uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
@@ -45,8 +40,6 @@ jobs:
           toolchain: "1.85.1"
 
       - name: Enforce workspace MSRV 1.85.1 compilation gate
-        env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
         run: |
           cargo +1.85.1 check --workspace --all-targets --locked
           cargo +1.85.1 check -p locksmith-daemon --locked --features prod-strict
@@ -68,18 +61,12 @@ jobs:
           '
 
       - name: Enforce strict workspace clippy gate (-D warnings, forbid unsafe)
-        env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
         run: cargo +1.99.1 clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Execute functional + adversarial red-team test suites
-        env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
         run: cargo +1.99.1 test --workspace --all-targets --locked
 
       - name: Build prod-strict release binary, audit symbols, and run clean-env startup KATs
-        env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
         run: |
           cargo +1.99.1 build --locked --release -p locksmith-daemon --features prod-strict
           if nm ./target/release/locksmith-daemon | grep -Eq 'SoftwareTestHsm|serve_ring0_hmac_stream|ConnectedRing0StreamUnwrapper'; then
