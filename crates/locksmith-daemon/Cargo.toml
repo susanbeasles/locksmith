@@ -1,0 +1,36 @@
+[package]
+name = "locksmith-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "locksmith-daemon"
+path = "src/main.rs"
+
+[features]
+default = []
+test-hsm = ["anvil-core/test-hsm"]
+prod-strict = ["anvil-core/prod-strict"]
+
+[dependencies]
+anvil-cache = { path = "../anvil-cache" }
+anvil-core = { path = "../anvil-core" }
+anvil-ipc = { path = "../anvil-ipc" }
+aws-lc-rs.workspace = true
+blake3.workspace = true
+locksmith-proxy = { path = "../locksmith-proxy" }
+rustix.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+anvil-core = { path = "../anvil-core", features = ["test-hsm"] }
+locksmith-daemon = { path = ".", features = ["test-hsm"] }
+tokio-rustls.workspace = true
+
+[lints]
+workspace = true

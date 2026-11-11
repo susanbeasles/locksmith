@@ -1,0 +1,200 @@
+name: CI, Supply-Chain Verification & Keyless OIDC Signing
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  verify:
+    name: Adversarial TDD, Clippy, Fmt, ShellCheck & Production KAT Gates
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout clean-room repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust 1.99.1 toolchain and MSRV 1.85.1 toolchain
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+        with:
+          toolchain: "1.99.1"
+          components: rustfmt, clippy
+
+      - name: Install declared workspace MSRV 1.85.1 toolchain
+        uses: dtolnay/rust-toolchain@ccc8c1f930153b792217f06c65a38f23a882993a # 1.85.1
+        with:
+          toolchain: "1.85.1"
+
+      - name: Enforce workspace MSRV 1.85.1 compilation gate
+        run: |
+          cargo +1.85.1 check --workspace --all-targets --locked
+          cargo +1.85.1 check -p locksmith-daemon --locked --features prod-strict
+
+      - name: Enforce rustfmt gate
+        run: cargo +1.99.1 fmt --all -- --check
+
+      - name: Enforce zero lint suppressions in non-test production source
+        run: |
+          python3 -c '
+          import glob, sys
+          for path in sorted(glob.glob("crates/*/src/**/*.rs", recursive=True)):
+              with open(path, encoding="utf-8") as fh:
+                  src = fh.read()
+              prod_part = src.split("#[cfg(test)]", 1)[0]
+              if "#[allow(" in prod_part or "#![allow(" in prod_part:
+                  print(f"Forbidden #[allow(...)] attribute in production code: {path}", file=sys.stderr)
+                  sys.exit(1)
+          '
+
+      - name: Enforce strict workspace clippy gate (-D warnings, forbid unsafe)
+        run: cargo +1.99.1 clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Execute functional + adversarial red-team test suites
+        run: cargo +1.99.1 test --workspace --all-targets --locked
+
+      - name: Build prod-strict release binary, audit symbols, and run clean-env startup KATs
+        run: |
+          cargo +1.99.1 build --locked --release -p locksmith-daemon --features prod-strict
+          if nm ./target/release/locksmith-daemon | grep -Eq 'SoftwareTestHsm|serve_ring0_hmac_stream|ConnectedRing0StreamUnwrapper'; then
+            echo "Forbidden test-hsm symbol detected in prod-strict binary" >&2
+            exit 1
+          fi
+          env -i PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" ./target/release/locksmith-daemon verify-self
+
+      - name: Validate POSIX /bin/sh syntax, ShellCheck, and CLI guards of infra/forge
+        run: |
+          sh -n infra/forge infra/test-forge.sh
+          shellcheck infra/forge infra/test-forge.sh
+          sh infra/test-forge.sh
+
+  docker-verify:
+    name: Hermetic Container Build & Read-Only Non-Root Runtime KAT Gate
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout clean-room repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Build digest-locked Dockerfile without pushing
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        with:
+          context: .
+          file: infra/Dockerfile
+          push: false
+          load: true
+          tags: locksmith-ci:verify
+          provenance: false
+
+      - name: Execute read-only cap-dropped non-root container verify-self KATs
+        run: |
+          docker run --rm \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --network=none \
+            --user 65532:65532 \
+            locksmith-ci:verify verify-self
+
+  build-push:
+    name: Build & Push Immutable OCI Image
+    needs:
+      - verify
+      - docker-verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build_push.outputs.digest }}
+    steps:
+      - name: Checkout clean-room repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Authenticate to GitHub Container Registry (GHCR)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push GHCR image from digest-locked Dockerfile
+        id: build_push
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        with:
+          context: .
+          file: infra/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:main
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          provenance: false
+
+  sign-and-attest:
+    name: Keyless Sigstore OIDC Sign & SLSA Provenance Attestation
+    needs: build-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Authenticate to GitHub Container Registry (GHCR)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install pinned Sigstore cosign
+        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+        with:
+          cosign-release: "v2.4.1"
+
+      - name: Keyless Sigstore OIDC sign and verify container image digest
+        env:
+          REPO_SLUG: ${{ github.repository }}
+          IMAGE_DIGEST: ${{ needs.build-push.outputs.digest }}
+        run: |
+          IMAGE_URI="ghcr.io/${REPO_SLUG}@${IMAGE_DIGEST}"
+          OIDC_IDENTITY="https://github.com/${REPO_SLUG}/.github/workflows/ci-and-sign.yml@refs/heads/main"
+          cosign sign --yes "${IMAGE_URI}"
+          cosign verify \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity "${OIDC_IDENTITY}" \
+            "${IMAGE_URI}"
+
+      - name: Emit SLSA build provenance attestation
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ needs.build-push.outputs.digest }}
+          push-to-registry: true

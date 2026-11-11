@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/anvil-core",
+    "crates/anvil-cache",
+    "crates/anvil-ipc",
+    "crates/locksmith-proxy",
+    "crates/locksmith-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[workspace.dependencies]
+aws-lc-rs = { version = "=1.19.0", default-features = false, features = ["aws-lc-sys", "alloc"] }
+blake3 = "=1.8.7"
+rustix = { version = "=0.38.44", features = ["fs", "process", "net"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs"] }
+tokio-vsock = "=0.7.3"
+zeroize = { version = "=1.9.1", features = ["derive"] }
