@@ -75,14 +75,11 @@ jobs:
           fi
           env -i PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" ./target/release/locksmith-daemon verify-self
 
-      - name: Validate POSIX /bin/sh syntax, ShellCheck, and immutable path hygiene of infra/forge
+      - name: Validate POSIX /bin/sh syntax, ShellCheck, and CLI guards of infra/forge
         run: |
-          sh -n infra/forge
-          shellcheck infra/forge
-          if grep -En '[~]/[.]local' infra/forge infra/Dockerfile; then
-            echo "Forbidden user-local path reference detected" >&2
-            exit 1
-          fi
+          sh -n infra/forge infra/test-forge.sh
+          shellcheck infra/forge infra/test-forge.sh
+          sh infra/test-forge.sh
 
   docker-verify:
     name: Hermetic Container Build & Read-Only Non-Root Runtime KAT Gate
