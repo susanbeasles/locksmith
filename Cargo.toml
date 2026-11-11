@@ -5,12 +5,13 @@ members = [
     "crates/anvil-cache",
     "crates/anvil-ipc",
     "crates/locksmith-proxy",
+    "crates/locksmith-daemon",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 license = "LicenseRef-Proprietary"
 publish = false
 

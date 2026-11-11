@@ -306,6 +306,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
 
 [[package]]
+name = "locksmith-daemon"
+version = "0.1.0"
+dependencies = [
+ "anvil-cache",
+ "anvil-core",
+ "anvil-ipc",
+ "aws-lc-rs",
+ "blake3",
+ "locksmith-proxy",
+ "rustix",
+ "rustls",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "locksmith-proxy"
 version = "0.1.0"
 dependencies = [

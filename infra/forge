@@ -1,0 +1,373 @@
+#!/bin/sh
+# Locksmith Ephemeral Stage 2 Host Controller (`forge`)
+#
+# Strict Clean-Room Invariants:
+# 1. Pure POSIX `/bin/sh` (`set -eu`), zero bashisms, portable across Linux & macOS/BSD.
+# 2. System installation strictly as `0555` (`root:root` or `root:wheel`) in `/usr/local/bin/forge`
+#    (compatible with immutable `/s/bin` mounts). Never touches per-user dot-local directories.
+# 3. Zero secrets in environment variables (`export`), CLI `argv` (`/proc/<pid>/cmdline`), or disk:
+#    - 1Password `op read` pipes Vultr API tokens directly into `curl --config -` via `stdin`.
+#    - 1Password `op read` pipes GHCR read tokens directly over SSH `stdin` into `docker login --password-stdin`.
+# 4. Mandatory keyless Sigstore `cosign verify` against GitHub Actions OIDC identity BEFORE `docker run`.
+# 5. Ephemeral lifecycle: `forge down` destroys all `locksmith-stage2` cloud instances (`$0.00/hr` idle).
+
+set -eu
+umask 077
+
+VULTR_API_BASE="https://api.vultr.com/v2"
+STAGE2_TAG="locksmith-stage2"
+DEFAULT_REGION="ewr"
+DEFAULT_PLAN="vc2-1c-2gb"
+# Vultr Debian 12 x64 Bookworm os_id
+DEFAULT_OS_ID="2136"
+
+LOCKSMITH_REPO="${LOCKSMITH_REPO:-susanbeasles/locksmith}"
+GHCR_USER="${GHCR_USER:-susanbeasles}"
+OP_VULTR_REF="${OP_VULTR_REF:-op://Locksmith/Vultr/api-key}"
+OP_GHCR_REF="${OP_GHCR_REF:-op://Locksmith/GHCR/read-token}"
+
+COSIGN_VERSION="v2.4.1"
+COSIGN_LINUX_AMD64_SHA256="8b29c326bcfb9f38f8c4d9c0bc9f9d957fd8d7d6e63612026f61f8eb65bd7128"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  forge up --ssh-key-id <VULTR_SSH_KEY_ID> --image <GHCR_IMAGE_WITH_SHA256_DIGEST> [--region <ID>] [--plan <ID>]
+  forge verify --host <IPV4> --image <GHCR_IMAGE_WITH_SHA256_DIGEST>
+  forge status
+  forge down
+  forge install-self [/usr/local/bin/forge]
+
+Environment overrides (non-secret identifiers only):
+  LOCKSMITH_REPO   GitHub owner/repo (default: susanbeasles/locksmith)
+  GHCR_USER        GHCR username (default: susanbeasles)
+  OP_VULTR_REF     1Password secret reference (default: op://Locksmith/Vultr/api-key)
+  OP_GHCR_REF      1Password secret reference (default: op://Locksmith/GHCR/read-token)
+EOF
+}
+
+die() {
+    printf 'forge error: %s\n' "$1" >&2
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found in PATH"
+}
+
+validate_digest_pinned_image() {
+    case "$1" in
+        ghcr.io/*@sha256:[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+            if [ "${#1}" -lt 80 ]; then
+                die "image URI '$1' does not contain a full 64-hex SHA-256 digest"
+            fi
+            ;;
+        *)
+            die "image URI must be pinned by immutable SHA-256 digest (ghcr.io/<owner>/<repo>@sha256:<64-hex>)"
+            ;;
+    esac
+}
+
+validate_safe_token() {
+    case "$1" in
+        ""|*[!A-Za-z0-9._:/@-]*)
+            die "unsafe characters in identifier '$2'"
+            ;;
+    esac
+}
+
+# Executes an authenticated Vultr v2 REST request by streaming the API token from `op read`
+# directly into `curl --config -` stdin so zero secret bytes ever touch env vars or argv.
+vultr_api() {
+    req_method="$1"
+    req_endpoint="$2"
+    shift 2
+
+    require_cmd op
+    require_cmd curl
+    require_cmd sed
+
+    op read "$OP_VULTR_REF" \
+        | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/header = "Authorization: Bearer /; s/$/"/' \
+        | curl --silent --show-error --fail \
+            --request "$req_method" \
+            --header "Content-Type: application/json" \
+            --url "${VULTR_API_BASE}${req_endpoint}" \
+            --config - \
+            "$@"
+}
+
+extract_instance_ids() {
+    require_cmd python3
+    python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+for inst in data.get("instances", []):
+    iid = inst.get("id", "")
+    if iid:
+        print(iid)
+'
+}
+
+extract_single_field() {
+    field_name="$1"
+    require_cmd python3
+    python3 -c '
+import json, sys
+field = sys.argv[1]
+data = json.load(sys.stdin)
+inst = data.get("instance", {})
+print(inst.get(field, ""))
+' "$field_name"
+}
+
+bootstrap_and_verify_remote() {
+    target_ip="$1"
+    image_uri="$2"
+
+    validate_safe_token "$target_ip" "host IP"
+    validate_digest_pinned_image "$image_uri"
+    validate_safe_token "$LOCKSMITH_REPO" "LOCKSMITH_REPO"
+    validate_safe_token "$GHCR_USER" "GHCR_USER"
+
+    oidc_identity="https://github.com/${LOCKSMITH_REPO}/.github/workflows/ci-and-sign.yml@refs/heads/main"
+    ssh_flags="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+
+    printf '[forge] Bootstrapping Docker Engine & Sigstore cosign on %s...\n' "$target_ip"
+    # shellcheck disable=SC2086
+    ssh $ssh_flags "root@${target_ip}" "sh -eu" <<EOF
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v docker >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y --no-install-recommends ca-certificates curl docker.io
+    systemctl enable --now docker
+fi
+if [ ! -x /usr/local/bin/cosign ]; then
+    tmp_cosign="\$(mktemp /tmp/cosign.XXXXXX)"
+    curl --silent --show-error --fail --location \
+        "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+        -o "\${tmp_cosign}"
+    printf '%s  %s\n' "${COSIGN_LINUX_AMD64_SHA256}" "\${tmp_cosign}" | sha256sum -c -
+    install -o 0 -g 0 -m 0555 "\${tmp_cosign}" /usr/local/bin/cosign
+    rm -f "\${tmp_cosign}"
+fi
+EOF
+
+    printf '[forge] Authenticating to ghcr.io on %s via stdin pipe (zero argv/disk token)...\n' "$target_ip"
+    # shellcheck disable=SC2086
+    op read "$OP_GHCR_REF" | ssh $ssh_flags "root@${target_ip}" \
+        "docker login ghcr.io -u '${GHCR_USER}' --password-stdin"
+
+    printf '[forge] Verifying keyless Sigstore OIDC signature & running read-only KAT container...\n'
+    # shellcheck disable=SC2086
+    ssh $ssh_flags "root@${target_ip}" "sh -eu" <<EOF
+/usr/local/bin/cosign verify \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    --certificate-identity "${oidc_identity}" \
+    "${image_uri}"
+
+docker pull "${image_uri}"
+
+docker run --rm \
+    --read-only \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges \
+    --pids-limit=128 \
+    --memory=256m \
+    --network=none \
+    --user 65532:65532 \
+    "${image_uri}" verify-self
+
+docker logout ghcr.io >/dev/null 2>&1 || true
+rm -f /root/.docker/config.json
+EOF
+    printf '[forge] Stage 2 attestation & read-only container KAT SUCCEEDED on %s.\n' "$target_ip"
+}
+
+cmd_up() {
+    region="$DEFAULT_REGION"
+    plan="$DEFAULT_PLAN"
+    ssh_key_id=""
+    image_uri=""
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --region)
+                [ "$#" -ge 2 ] || die "missing value for --region"
+                region="$2"
+                shift 2
+                ;;
+            --plan)
+                [ "$#" -ge 2 ] || die "missing value for --plan"
+                plan="$2"
+                shift 2
+                ;;
+            --ssh-key-id)
+                [ "$#" -ge 2 ] || die "missing value for --ssh-key-id"
+                ssh_key_id="$2"
+                shift 2
+                ;;
+            --image)
+                [ "$#" -ge 2 ] || die "missing value for --image"
+                image_uri="$2"
+                shift 2
+                ;;
+            *)
+                die "unknown flag '$1' for 'forge up'"
+                ;;
+        esac
+    done
+
+    [ -n "$ssh_key_id" ] || die "'forge up' requires --ssh-key-id <VULTR_SSH_KEY_ID>"
+    [ -n "$image_uri" ] || die "'forge up' requires --image <GHCR_IMAGE_WITH_SHA256_DIGEST>"
+
+    validate_safe_token "$region" "region"
+    validate_safe_token "$plan" "plan"
+    validate_safe_token "$ssh_key_id" "ssh-key-id"
+    validate_digest_pinned_image "$image_uri"
+
+    payload=$(printf '{"region":"%s","plan":"%s","os_id":%s,"label":"locksmith-stage2","hostname":"locksmith-stage2","sshkey_id":["%s"],"tags":["%s"],"backups":"disabled"}' \
+        "$region" "$plan" "$DEFAULT_OS_ID" "$ssh_key_id" "$STAGE2_TAG")
+
+    printf '[forge] Provisioning ephemeral Vultr instance (region=%s, plan=%s)...\n' "$region" "$plan"
+    create_json=$(vultr_api POST "/instances" --data "$payload")
+    instance_id=$(printf '%s' "$create_json" | extract_single_field "id")
+    [ -n "$instance_id" ] || die "failed to parse new Vultr instance ID"
+    printf '[forge] Created instance %s; polling until active...\n' "$instance_id"
+
+    attempt=0
+    main_ip=""
+    while [ "$attempt" -lt 60 ]; do
+        sleep 5
+        attempt=$((attempt + 1))
+        info_json=$(vultr_api GET "/instances/${instance_id}")
+        inst_status=$(printf '%s' "$info_json" | extract_single_field "status")
+        power_status=$(printf '%s' "$info_json" | extract_single_field "power_status")
+        candidate_ip=$(printf '%s' "$info_json" | extract_single_field "main_ip")
+        if [ "$inst_status" = "active" ] && [ "$power_status" = "running" ] && [ -n "$candidate_ip" ] && [ "$candidate_ip" != "0.0.0.0" ]; then
+            main_ip="$candidate_ip"
+            break
+        fi
+    done
+
+    [ -n "$main_ip" ] || die "timed out waiting for Vultr instance ${instance_id} IPv4 readiness"
+    printf '[forge] Instance %s active at %s; waiting for SSH daemon...\n' "$instance_id" "$main_ip"
+
+    ssh_ready=0
+    attempt=0
+    while [ "$attempt" -lt 30 ]; do
+        if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "root@${main_ip}" "true" >/dev/null 2>&1; then
+            ssh_ready=1
+            break
+        fi
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+    [ "$ssh_ready" -eq 1 ] || die "SSH did not become ready on ${main_ip} (run 'forge down' to clean up)"
+
+    bootstrap_and_verify_remote "$main_ip" "$image_uri"
+    printf '[forge] Ephemeral instance %s (%s) verified. Run "forge down" immediately when finished.\n' "$instance_id" "$main_ip"
+}
+
+cmd_verify() {
+    host_ip=""
+    image_uri=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --host)
+                [ "$#" -ge 2 ] || die "missing value for --host"
+                host_ip="$2"
+                shift 2
+                ;;
+            --image)
+                [ "$#" -ge 2 ] || die "missing value for --image"
+                image_uri="$2"
+                shift 2
+                ;;
+            *)
+                die "unknown flag '$1' for 'forge verify'"
+                ;;
+        esac
+    done
+    [ -n "$host_ip" ] || die "'forge verify' requires --host <IPV4>"
+    [ -n "$image_uri" ] || die "'forge verify' requires --image <GHCR_IMAGE_WITH_SHA256_DIGEST>"
+    bootstrap_and_verify_remote "$host_ip" "$image_uri"
+}
+
+cmd_status() {
+    list_json=$(vultr_api GET "/instances?tag=${STAGE2_TAG}")
+    require_cmd python3
+    printf '%s' "$list_json" | python3 -c '
+import json, sys
+instances = json.load(sys.stdin).get("instances", [])
+if not instances:
+    print("[forge] 0 active locksmith-stage2 instances ($0.00/hr idle state verified).")
+else:
+    print(f"[forge] {len(instances)} active locksmith-stage2 instance(s):")
+    for i in instances:
+        print(f"  - id={i.get(\"id\")} ip={i.get(\"main_ip\")} region={i.get(\"region\")} status={i.get(\"status\")}")
+'
+}
+
+cmd_down() {
+    list_json=$(vultr_api GET "/instances?tag=${STAGE2_TAG}")
+    ids=$(printf '%s' "$list_json" | extract_instance_ids)
+
+    if [ -z "$ids" ]; then
+        printf '[forge] No active locksmith-stage2 instances found ($0.00/hr idle state).\n'
+        return 0
+    fi
+
+    for inst_id in $ids; do
+        validate_safe_token "$inst_id" "instance_id"
+        printf '[forge] Destroying Vultr instance %s...\n' "$inst_id"
+        vultr_api DELETE "/instances/${inst_id}" >/dev/null
+    done
+
+    sleep 3
+    post_json=$(vultr_api GET "/instances?tag=${STAGE2_TAG}")
+    remaining=$(printf '%s' "$post_json" | extract_instance_ids)
+    if [ -n "$remaining" ]; then
+        die "some locksmith-stage2 instances are still terminating: ${remaining}"
+    fi
+    printf '[forge] All locksmith-stage2 instances destroyed ($0.00/hr idle state verified).\n'
+}
+
+cmd_install_self() {
+    dest="${1:-/usr/local/bin/forge}"
+    case "$dest" in
+        /usr/local/bin/*|/s/bin/*) ;;
+        *) die "destination '$dest' must reside under /usr/local/bin or /s/bin" ;;
+    esac
+
+    os_name=$(uname -s)
+    if [ "$os_name" = "Darwin" ] || [ "$os_name" = "FreeBSD" ] || [ "$os_name" = "OpenBSD" ]; then
+        root_group="wheel"
+    else
+        root_group="root"
+    fi
+
+    install -o root -g "$root_group" -m 0555 "$0" "$dest"
+    printf '[forge] Installed 0555 root:%s -> %s\n' "$root_group" "$dest"
+}
+
+[ "$#" -ge 1 ] || {
+    usage >&2
+    exit 1
+}
+
+subcmd="$1"
+shift
+
+case "$subcmd" in
+    up) cmd_up "$@" ;;
+    verify) cmd_verify "$@" ;;
+    status) cmd_status "$@" ;;
+    down) cmd_down "$@" ;;
+    install-self) cmd_install_self "$@" ;;
+    --help|-h|help) usage ;;
+    *)
+        usage >&2
+        die "unknown subcommand '$subcmd'"
+        ;;
+esac
