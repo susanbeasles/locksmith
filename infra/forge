@@ -10,7 +10,7 @@
 #    - `op read --` exit status and non-empty output verified prior to streaming Vultr API tokens
 #      into `curl --proto '=https' --tlsv1.2 -fsSL --config -` over `stdin`.
 #    - `op read --` streams GHCR read tokens over SSH `stdin` into `docker login --password-stdin`
-#      backed exclusively by an ephemeral `/run` tmpfs `DOCKER_CONFIG` wiped by `trap` on `EXIT INT TERM`.
+#      backed exclusively by an ephemeral `/run` tmpfs `DOCKER_CONFIG` wiped by `trap` on `EXIT INT TERM HUP`.
 # 4. All remote heredocs are strictly single-quoted (`<<'EOF'`) with zero local shell expansion.
 # 5. Mandatory keyless Sigstore `cosign verify` against GitHub Actions OIDC identity BEFORE `docker run`.
 # 6. Ephemeral lifecycle: `forge down` destroys all `locksmith-stage2` cloud instances (`$0.00/hr` idle).
@@ -41,7 +41,7 @@ cleanup_local() {
         rm -f -- "$EPHEMERAL_KNOWN_HOSTS"
     fi
 }
-trap cleanup_local EXIT INT TERM
+trap cleanup_local EXIT INT TERM HUP
 
 usage() {
     cat <<'EOF'
@@ -314,14 +314,14 @@ fi
 
 if [ ! -x /usr/local/bin/cosign ]; then
     tmp_cosign="$(mktemp /run/cosign.XXXXXX)"
-    trap 'rm -f -- "$tmp_cosign"' EXIT INT TERM
+    trap 'rm -f -- "$tmp_cosign"' EXIT INT TERM HUP
     curl --proto '=https' --tlsv1.2 -fsSL \
         "https://github.com/sigstore/cosign/releases/download/${cosign_ver}/cosign-linux-amd64" \
         -o "$tmp_cosign"
     printf '%s  %s\n' "$cosign_sha" "$tmp_cosign" | sha256sum -c -
     install -o 0 -g 0 -m 0555 "$tmp_cosign" /usr/local/bin/cosign
     rm -f -- "$tmp_cosign"
-    trap - EXIT INT TERM
+    trap - EXIT INT TERM HUP
 fi
 
 cat <<'VERIFY_SCRIPT_EOF' > /run/locksmith-stage2-verify
@@ -339,7 +339,7 @@ cleanup_remote() {
     DOCKER_CONFIG="$ephemeral_docker_cfg" docker logout ghcr.io >/dev/null 2>&1 || true
     rm -rf -- "$ephemeral_docker_cfg" /run/locksmith-stage2-verify
 }
-trap cleanup_remote EXIT INT TERM
+trap cleanup_remote EXIT INT TERM HUP
 
 export DOCKER_CONFIG="$ephemeral_docker_cfg"
 docker login ghcr.io -u "$ghcr_user" --password-stdin

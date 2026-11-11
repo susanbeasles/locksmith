@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,27 +17,76 @@ pub struct ReplayFilterConfig {
     pub max_entries: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClockDomain {
+    MonotonicSystem,
+    ExplicitCaller,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BurnedRecord {
+    expires_at_ms: u64,
+    domain: ClockDomain,
+}
+
 #[derive(Debug)]
 struct ReplayState {
-    /// Maps active `nonce -> expires_at_ms` (inclusive upper bound of retention).
-    burned: HashMap<[u8; 32], u64>,
-    /// FIFO queue of `(nonce, expires_at_ms)` monotonically ordered by `expires_at_ms`.
-    order: VecDeque<([u8; 32], u64)>,
-    /// Monotonic high-water mark preventing backward wall-clock steps from rewinding `now_ms`.
-    last_now_ms: u64,
+    /// Maps active `nonce -> BurnedRecord`.
+    burned: HashMap<[u8; 32], BurnedRecord>,
+    /// FIFO queue of `(nonce, expires_at_ms)` burned under `monotonic_now_ms()`.
+    system_order: VecDeque<([u8; 32], u64)>,
+    /// FIFO queue of `(nonce, expires_at_ms)` burned under explicit `check_and_burn` callers.
+    explicit_order: VecDeque<([u8; 32], u64)>,
+    /// Monotonic high-water mark strictly scoped to explicit `check_and_burn` callers.
+    explicit_high_water_ms: u64,
 }
 
 impl ReplayState {
-    fn is_expired(expires_at_ms: u64, effective_now_ms: u64) -> bool {
-        expires_at_ms < effective_now_ms
+    const fn is_expired_at(expires_at_ms: u64, domain_now_ms: u64) -> bool {
+        expires_at_ms < domain_now_ms
     }
 
-    fn purge_expired_front(&mut self, effective_now_ms: u64) {
-        while let Some(&(front_nonce, front_expires_at)) = self.order.front() {
-            if Self::is_expired(front_expires_at, effective_now_ms) {
-                self.order.pop_front();
-                // Guarded removal: only delete from `burned` if its expiry matches this exact queue entry.
-                if self.burned.get(&front_nonce) == Some(&front_expires_at) {
+    const fn is_record_expired(
+        record: BurnedRecord,
+        system_now_ms: u64,
+        explicit_now_ms: u64,
+    ) -> bool {
+        match record.domain {
+            ClockDomain::MonotonicSystem => {
+                Self::is_expired_at(record.expires_at_ms, system_now_ms)
+            }
+            ClockDomain::ExplicitCaller => {
+                Self::is_expired_at(record.expires_at_ms, explicit_now_ms)
+            }
+        }
+    }
+
+    fn purge_expired_front(&mut self, system_now_ms: u64, explicit_now_ms: u64) {
+        while let Some(&(front_nonce, front_expires_at)) = self.system_order.front() {
+            if Self::is_expired_at(front_expires_at, system_now_ms) {
+                self.system_order.pop_front();
+                if self.burned.get(&front_nonce)
+                    == Some(&BurnedRecord {
+                        expires_at_ms: front_expires_at,
+                        domain: ClockDomain::MonotonicSystem,
+                    })
+                {
+                    self.burned.remove(&front_nonce);
+                }
+            } else {
+                break;
+            }
+        }
+
+        while let Some(&(front_nonce, front_expires_at)) = self.explicit_order.front() {
+            if Self::is_expired_at(front_expires_at, explicit_now_ms) {
+                self.explicit_order.pop_front();
+                if self.burned.get(&front_nonce)
+                    == Some(&BurnedRecord {
+                        expires_at_ms: front_expires_at,
+                        domain: ClockDomain::ExplicitCaller,
+                    })
+                {
                     self.burned.remove(&front_nonce);
                 }
             } else {
@@ -45,11 +95,29 @@ impl ReplayState {
         }
     }
 
-    fn purge_expired_full(&mut self, effective_now_ms: u64) {
+    fn purge_expired_full(&mut self, system_now_ms: u64, explicit_now_ms: u64) {
         self.burned
-            .retain(|_, &mut expires_at| !Self::is_expired(expires_at, effective_now_ms));
-        self.order
-            .retain(|&(nonce, expires_at)| self.burned.get(&nonce) == Some(&expires_at));
+            .retain(|_, &mut rec| !Self::is_record_expired(rec, system_now_ms, explicit_now_ms));
+        self.system_order.retain(|&(nonce, expires_at)| {
+            self.burned.get(&nonce)
+                == Some(&BurnedRecord {
+                    expires_at_ms: expires_at,
+                    domain: ClockDomain::MonotonicSystem,
+                })
+        });
+        self.explicit_order.retain(|&(nonce, expires_at)| {
+            self.burned.get(&nonce)
+                == Some(&BurnedRecord {
+                    expires_at_ms: expires_at,
+                    domain: ClockDomain::ExplicitCaller,
+                })
+        });
+    }
+
+    fn total_queued(&self) -> usize {
+        self.system_order
+            .len()
+            .saturating_add(self.explicit_order.len())
     }
 }
 
@@ -59,6 +127,8 @@ pub struct ReplayFilter {
     config: ReplayFilterConfig,
     anchor_instant: Instant,
     anchor_epoch_ms: u64,
+    /// Monotonic high-water mark updated **exclusively** by [`Self::monotonic_now_ms`].
+    last_now_ms: AtomicU64,
     state: Mutex<ReplayState>,
 }
 
@@ -78,10 +148,12 @@ impl ReplayFilter {
             config,
             anchor_instant: Instant::now(),
             anchor_epoch_ms,
+            last_now_ms: AtomicU64::new(anchor_epoch_ms),
             state: Mutex::new(ReplayState {
                 burned: HashMap::new(),
-                order: VecDeque::new(),
-                last_now_ms: 0,
+                system_order: VecDeque::new(),
+                explicit_order: VecDeque::new(),
+                explicit_high_water_ms: 0,
             }),
         })
     }
@@ -95,25 +167,37 @@ impl ReplayFilter {
     }
 
     /// Returns a monotonically non-decreasing epoch millisecond reading anchored
-    /// to [`std::time::Instant`], immune to OS `SystemTime` NTP backward steps.
+    /// to [`std::time::Instant`], immune to OS `SystemTime` NTP backward steps and
+    /// isolated from caller-supplied timestamps in [`Self::check_and_burn`].
     #[must_use]
     pub fn monotonic_now_ms(&self) -> u64 {
         let elapsed_ms =
             u64::try_from(self.anchor_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.anchor_epoch_ms.saturating_add(elapsed_ms)
+        let candidate = self.anchor_epoch_ms.saturating_add(elapsed_ms);
+        let prev = self.last_now_ms.fetch_max(candidate, Ordering::SeqCst);
+        candidate.max(prev)
     }
 
-    /// Validates `timestamp_ms` against monotonic `now_ms +- skew_window_ms` and
-    /// atomically burns `nonce` across the full `2 * skew_window_ms` validity span.
-    pub fn check_and_burn(
+    fn check_and_burn_in_domain(
         &self,
         nonce: [u8; 32],
         timestamp_ms: u64,
-        now_ms: u64,
+        caller_now_ms: Option<u64>,
     ) -> Result<(), ReplayError> {
         let mut guard = self.state.lock().map_err(|_| ReplayError::StateCorrupted)?;
-        let effective_now_ms = now_ms.max(guard.last_now_ms);
-        guard.last_now_ms = effective_now_ms;
+        let system_now_ms = self.monotonic_now_ms();
+        let (domain, effective_now_ms, explicit_now_ms) = match caller_now_ms {
+            None => (
+                ClockDomain::MonotonicSystem,
+                system_now_ms,
+                guard.explicit_high_water_ms,
+            ),
+            Some(raw_now_ms) => {
+                let clamped = raw_now_ms.max(guard.explicit_high_water_ms);
+                guard.explicit_high_water_ms = clamped;
+                (ClockDomain::ExplicitCaller, clamped, clamped)
+            }
+        };
 
         if effective_now_ms > timestamp_ms
             && effective_now_ms - timestamp_ms > self.config.skew_window_ms
@@ -134,21 +218,21 @@ impl ReplayFilter {
             });
         }
 
-        guard.purge_expired_front(effective_now_ms);
+        guard.purge_expired_front(system_now_ms, explicit_now_ms);
 
-        if let Some(&expires_at_ms) = guard.burned.get(&nonce) {
-            if !ReplayState::is_expired(expires_at_ms, effective_now_ms) {
+        if let Some(&record) = guard.burned.get(&nonce) {
+            if !ReplayState::is_record_expired(record, system_now_ms, explicit_now_ms) {
                 return Err(ReplayError::NonceAlreadyBurned);
             }
             guard.burned.remove(&nonce);
         }
 
         if guard.burned.len() >= self.config.max_entries
-            || guard.order.len() >= self.config.max_entries
+            || guard.total_queued() >= self.config.max_entries
         {
-            guard.purge_expired_full(effective_now_ms);
+            guard.purge_expired_full(system_now_ms, explicit_now_ms);
             if guard.burned.len() >= self.config.max_entries
-                || guard.order.len() >= self.config.max_entries
+                || guard.total_queued() >= self.config.max_entries
             {
                 return Err(ReplayError::CapacityExceeded {
                     max_entries: self.config.max_entries,
@@ -158,9 +242,40 @@ impl ReplayFilter {
 
         let retention_ms = self.config.skew_window_ms.saturating_mul(2);
         let expires_at_ms = effective_now_ms.saturating_add(retention_ms);
-        guard.burned.insert(nonce, expires_at_ms);
-        guard.order.push_back((nonce, expires_at_ms));
+        guard.burned.insert(
+            nonce,
+            BurnedRecord {
+                expires_at_ms,
+                domain,
+            },
+        );
+        match domain {
+            ClockDomain::MonotonicSystem => guard.system_order.push_back((nonce, expires_at_ms)),
+            ClockDomain::ExplicitCaller => guard.explicit_order.push_back((nonce, expires_at_ms)),
+        }
         Ok(())
+    }
+
+    /// Validates `timestamp_ms` against explicit `now_ms +- skew_window_ms` and
+    /// atomically burns `nonce` across the full `2 * skew_window_ms` validity span
+    /// without mutating [`Self::monotonic_now_ms`] state.
+    pub fn check_and_burn(
+        &self,
+        nonce: [u8; 32],
+        timestamp_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), ReplayError> {
+        self.check_and_burn_in_domain(nonce, timestamp_ms, Some(now_ms))
+    }
+
+    /// Alias for [`Self::check_and_burn`] accepting an explicit caller clock reading.
+    pub fn check_and_burn_at(
+        &self,
+        nonce: [u8; 32],
+        timestamp_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), ReplayError> {
+        self.check_and_burn_in_domain(nonce, timestamp_ms, Some(now_ms))
     }
 
     /// Validates and burns `nonce` against the monotonic clock anchored at filter startup.
@@ -169,7 +284,7 @@ impl ReplayFilter {
         nonce: [u8; 32],
         timestamp_ms: u64,
     ) -> Result<(), ReplayError> {
-        self.check_and_burn(nonce, timestamp_ms, self.monotonic_now_ms())
+        self.check_and_burn_in_domain(nonce, timestamp_ms, None)
     }
 
     /// Returns the number of currently retained nonces in the filter.

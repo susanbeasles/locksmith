@@ -4,16 +4,18 @@ use std::time::Duration;
 
 use anvil_cache::sanitize::validate_metadata_str;
 use anvil_cache::seal::seal_and_verify_reader;
-use anvil_core::kdf::{derive_subkey, DOMAIN_UNWRAP_KEK};
+use anvil_core::kdf::derive_subkey;
 use anvil_core::ledger::{AuditLedger, LedgerEventInput};
 use anvil_core::replay::ReplayFilter;
 use anvil_core::unwrap::{
-    SealedSecretEnvelope, UnwrapAad, ENVELOPE_VERSION_V1, MAX_ENVELOPE_CIPHERTEXT_BYTES,
+    verify_deterministic_unwrap_kat, HardwareUnwrapper, HostShare, KatChallengeBoundUnwrapper,
+    SealedSecretEnvelope, SecretUnwrapper, UnwrapAad, ENVELOPE_VERSION_V1,
+    KAT_EXPECTED_CIPHERTEXT_AND_TAG, KAT_GUEST_CID, KAT_HKDF_SALT, KAT_HOST_SHARE, KAT_NONCE,
+    KAT_PLAINTEXT, KAT_POLICY_HASH, KAT_SECRET_ID, MAX_ENVELOPE_CIPHERTEXT_BYTES,
 };
 use anvil_core::{CryptoError, ReplayError};
 use anvil_ipc::frame::read_bounded_frame;
 use anvil_ipc::IpcError;
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use aws_lc_rs::constant_time::verify_slices_are_equal;
 use locksmith_proxy::{
     scrub_secret_reflections, OutboundHttpRequest, PolicyError, SCRUB_REPLACEMENT_TOKEN,
@@ -24,6 +26,16 @@ use zeroize::Zeroizing;
 use crate::error::DaemonError;
 use crate::harden::{harden_process, is_process_nondumpable};
 use crate::hsm::exchange_ring0_challenge;
+
+const EXPECTED_HKDF_K1: [u8; 32] = [
+    0x45, 0xd3, 0xf1, 0x17, 0xcd, 0x04, 0x25, 0x71, 0x2a, 0xae, 0xde, 0x26, 0x4a, 0xea, 0xc8, 0xdb,
+    0xeb, 0x78, 0x8f, 0x39, 0xe8, 0x75, 0xfd, 0x4e, 0x2d, 0x13, 0xc8, 0x54, 0x15, 0x03, 0x33, 0xfd,
+];
+
+const EXPECTED_HKDF_K2: [u8; 32] = [
+    0x42, 0xf6, 0xbd, 0x6d, 0xbe, 0x28, 0x02, 0xae, 0x41, 0xbb, 0xcb, 0x22, 0xa0, 0x79, 0x72, 0x95,
+    0xf3, 0xc5, 0x51, 0x33, 0xa5, 0x83, 0xaa, 0x82, 0x41, 0xb1, 0x73, 0x41, 0xf8, 0x7c, 0x30, 0x68,
+];
 
 /// Summary of deterministic startup self-tests (`locksmith-daemon verify-self`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,107 +61,94 @@ fn hex_encode_32(bytes: &[u8; 32]) -> String {
 }
 
 fn verify_production_2of2_aead_and_ring0_guards() -> Result<(), DaemonError> {
-    let mut ephemeral = Zeroizing::new([0u8; 108]);
-    aws_lc_rs::rand::fill(&mut *ephemeral).map_err(|_| CryptoError::RngFailure)?;
+    // 1. Execute deterministic 2-of-2 seal + unwrap + tamper KAT directly via SecretUnwrapper
+    let kat_envelope =
+        verify_deterministic_unwrap_kat().map_err(|_| DaemonError::SelfTestFailed {
+            check: "aead_2of2_unwrap_kat",
+            detail: "SecretUnwrapper deterministic KAT failed".to_owned(),
+        })?;
+    if verify_slices_are_equal(
+        &kat_envelope.ciphertext_and_tag,
+        &KAT_EXPECTED_CIPHERTEXT_AND_TAG,
+    )
+    .is_err()
+    {
+        return Err(DaemonError::SelfTestFailed {
+            check: "aead_2of2_unwrap_kat",
+            detail: "SealedSecretEnvelope ciphertext+tag did not match precomputed RFC 8439 vector"
+                .to_owned(),
+        });
+    }
 
-    let mut host_share = Zeroizing::new([0u8; 32]);
-    host_share.copy_from_slice(&ephemeral[0..32]);
-    let mut hw_share = Zeroizing::new([0u8; 32]);
-    hw_share.copy_from_slice(&ephemeral[32..64]);
-    let mut hkdf_salt = [0u8; 32];
-    hkdf_salt.copy_from_slice(&ephemeral[64..96]);
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(&ephemeral[96..108]);
-
-    let aad = UnwrapAad {
-        secret_id: "selftest/kat",
-        policy_hash: [0x7E; 32],
-        guest_cid: 3,
-    };
-    let canonical_aad = aad.encode_canonical()?;
-    let kek = derive_subkey(
-        &hkdf_salt,
-        &*host_share,
-        &[DOMAIN_UNWRAP_KEK, &*hw_share, &canonical_aad],
-    )?;
-
-    let kat_plaintext = Zeroizing::new(*b"kat-ephemeral-secret-vector-v1!!");
-    let unbound_seal =
-        UnboundKey::new(&CHACHA20_POLY1305, &*kek).map_err(|_| CryptoError::KeyDerivationFailed)?;
-    let seal_key = LessSafeKey::new(unbound_seal);
-    let mut ct = kat_plaintext.to_vec();
-    seal_key
-        .seal_in_place_append_tag(
-            Nonce::assume_unique_for_key(nonce_bytes),
-            Aad::from(&canonical_aad),
-            &mut ct,
-        )
-        .map_err(|_| CryptoError::AuthenticationFailed)?;
-
-    let envelope = SealedSecretEnvelope {
+    // 2. Construct precomputed SealedSecretEnvelope from fixed KAT constants and unwrap directly via SecretUnwrapper
+    let expected_envelope = SealedSecretEnvelope {
         version: ENVELOPE_VERSION_V1,
-        hkdf_salt,
-        nonce: nonce_bytes,
-        ciphertext_and_tag: ct,
+        hkdf_salt: KAT_HKDF_SALT,
+        nonce: KAT_NONCE,
+        ciphertext_and_tag: KAT_EXPECTED_CIPHERTEXT_AND_TAG.to_vec(),
     };
-    let wire = envelope.to_bytes();
-    let parsed = SealedSecretEnvelope::from_bytes(&wire)?;
+    let unwrapper = SecretUnwrapper::new(
+        HostShare::from_bytes(KAT_HOST_SHARE),
+        KatChallengeBoundUnwrapper,
+    );
+    let kat_aad = UnwrapAad {
+        secret_id: KAT_SECRET_ID,
+        policy_hash: KAT_POLICY_HASH,
+        guest_cid: KAT_GUEST_CID,
+    };
+    let opened = unwrapper.unwrap_envelope(&expected_envelope, &kat_aad)?;
+    if verify_slices_are_equal(opened.expose_secret(), KAT_PLAINTEXT).is_err() {
+        return Err(DaemonError::SelfTestFailed {
+            check: "aead_2of2_unwrap",
+            detail: "SecretUnwrapper::unwrap_envelope plaintext mismatch against KAT vector"
+                .to_owned(),
+        });
+    }
 
-    // Oversized (> 64 KiB) envelope wire payload must fail closed before unwrapping
+    // 3. Verify KatChallengeBoundUnwrapper rejects non-KAT challenges (cannot act as a general mock HSM)
+    if !matches!(
+        KatChallengeBoundUnwrapper.derive_hardware_share(&[0u8; 32]),
+        Err(CryptoError::HardwareFailure)
+    ) {
+        return Err(DaemonError::SelfTestFailed {
+            check: "kat_adapter_scope",
+            detail: "KatChallengeBoundUnwrapper accepted a non-KAT challenge".to_owned(),
+        });
+    }
+
+    // 4. 1-bit ciphertext tamper must fail SecretUnwrapper::unwrap_envelope authentication
+    let mut tampered_env = expected_envelope;
+    if let Some(b) = tampered_env.ciphertext_and_tag.first_mut() {
+        *b ^= 0x01;
+    }
+    if !matches!(
+        unwrapper.unwrap_envelope(&tampered_env, &kat_aad),
+        Err(CryptoError::AuthenticationFailed)
+    ) {
+        return Err(DaemonError::SelfTestFailed {
+            check: "aead_tamper_reject",
+            detail: "1-bit tampered SealedSecretEnvelope did not fail closed".to_owned(),
+        });
+    }
+
+    // 5. Oversized (> 64 KiB) envelope wire payload must fail closed before unwrapping
     let oversized_len = (MAX_ENVELOPE_CIPHERTEXT_BYTES + 1) as u32;
     let mut oversized_wire = vec![ENVELOPE_VERSION_V1];
-    oversized_wire.extend_from_slice(&hkdf_salt);
-    oversized_wire.extend_from_slice(&nonce_bytes);
+    oversized_wire.extend_from_slice(&KAT_HKDF_SALT);
+    oversized_wire.extend_from_slice(&KAT_NONCE);
     oversized_wire.extend_from_slice(&oversized_len.to_be_bytes());
     oversized_wire.resize(1 + 32 + 12 + 4 + MAX_ENVELOPE_CIPHERTEXT_BYTES + 1, 0u8);
-    if SealedSecretEnvelope::from_bytes(&oversized_wire) != Err(CryptoError::InvalidEnvelopeFormat)
-    {
+    if !matches!(
+        SealedSecretEnvelope::from_bytes(&oversized_wire),
+        Err(CryptoError::InvalidEnvelopeFormat)
+    ) {
         return Err(DaemonError::SelfTestFailed {
             check: "envelope_size_cap",
             detail: "oversized SealedSecretEnvelope was not rejected".to_owned(),
         });
     }
 
-    // 1-bit ciphertext tamper must fail AEAD authentication
-    let mut tampered = parsed.clone().ciphertext_and_tag;
-    if let Some(b) = tampered.first_mut() {
-        *b ^= 0x01;
-    }
-    let unbound_tamper =
-        UnboundKey::new(&CHACHA20_POLY1305, &*kek).map_err(|_| CryptoError::KeyDerivationFailed)?;
-    if LessSafeKey::new(unbound_tamper)
-        .open_in_place(
-            Nonce::assume_unique_for_key(parsed.nonce),
-            Aad::from(&canonical_aad),
-            &mut tampered,
-        )
-        .is_ok()
-    {
-        return Err(DaemonError::SelfTestFailed {
-            check: "aead_tamper_reject",
-            detail: "1-bit tampered ChaCha20-Poly1305 ciphertext did not fail closed".to_owned(),
-        });
-    }
-
-    // Valid open recovers exact plaintext
-    let mut opened_buf = Zeroizing::new(parsed.ciphertext_and_tag);
-    let unbound_open =
-        UnboundKey::new(&CHACHA20_POLY1305, &*kek).map_err(|_| CryptoError::KeyDerivationFailed)?;
-    let opened = LessSafeKey::new(unbound_open)
-        .open_in_place(
-            Nonce::assume_unique_for_key(parsed.nonce),
-            Aad::from(&canonical_aad),
-            &mut opened_buf,
-        )
-        .map_err(|_| CryptoError::AuthenticationFailed)?;
-    if verify_slices_are_equal(opened, &*kat_plaintext).is_err() {
-        return Err(DaemonError::SelfTestFailed {
-            check: "aead_2of2_unwrap",
-            detail: "decrypted ChaCha20-Poly1305 plaintext mismatch".to_owned(),
-        });
-    }
-
-    // Production Ring 0 client must enforce SO_PEERCRED UID match and reject closed/rogue peers
+    // 6. Production Ring 0 client must enforce SO_PEERCRED UID match and reject closed/rogue peers
     #[cfg(target_os = "linux")]
     {
         let current_uid = rustix::process::getuid().as_raw();
@@ -161,7 +160,7 @@ fn verify_production_2of2_aead_and_ring0_guards() -> Result<(), DaemonError> {
             Duration::from_millis(200),
             b"LOCKSMITH-CHALLENGE",
         );
-        if wrong_uid_res != Err(CryptoError::HardwareFailure) {
+        if !matches!(wrong_uid_res, Err(CryptoError::HardwareFailure)) {
             return Err(DaemonError::SelfTestFailed {
                 check: "ring0_peercred_guard",
                 detail: "Ring 0 SO_PEERCRED UID mismatch did not fail closed".to_owned(),
@@ -186,22 +185,22 @@ pub async fn run_self_test() -> Result<SelfTestReport, DaemonError> {
         });
     }
 
-    // 2. Canonical Length-Prefixed HKDF-SHA256 Tuple Separation KAT
+    // 2. Canonical Length-Prefixed HKDF-SHA256 Tuple Separation & Precomputed Digest KAT
     let ikm = Zeroizing::new([0xA5u8; 32]);
     let salt = [0x3Cu8; 32];
     let k1 = derive_subkey(&salt, &*ikm, &[b"unwrap-kek-v1", b"admin", b"read"])?;
     let k2 = derive_subkey(&salt, &*ikm, &[b"unwrap-kek-v1", b"admi", b"nread"])?;
-    let k1_repeat = derive_subkey(&salt, &*ikm, &[b"unwrap-kek-v1", b"admin", b"read"])?;
-    if verify_slices_are_equal(&*k1, &*k1_repeat).is_err()
+    if verify_slices_are_equal(&*k1, &EXPECTED_HKDF_K1).is_err()
+        || verify_slices_are_equal(&*k2, &EXPECTED_HKDF_K2).is_err()
         || verify_slices_are_equal(&*k1, &*k2).is_ok()
     {
         return Err(DaemonError::SelfTestFailed {
             check: "hkdf_tuple_separation",
-            detail: "canonical HKDF domain separation check failed".to_owned(),
+            detail: "canonical HKDF-SHA256 output did not match precomputed KAT digests".to_owned(),
         });
     }
 
-    // 3. Production 2-of-2 ChaCha20-Poly1305 Envelope + Ring 0 SO_PEERCRED Guard KAT
+    // 3. Production 2-of-2 ChaCha20-Poly1305 SecretUnwrapper KAT + Ring 0 SO_PEERCRED Guard
     tokio::task::spawn_blocking(verify_production_2of2_aead_and_ring0_guards)
         .await
         .map_err(|e| DaemonError::Io(e.to_string()))??;

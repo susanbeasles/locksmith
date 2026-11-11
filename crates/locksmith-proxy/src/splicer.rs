@@ -437,6 +437,7 @@ pub fn scrub_secret_reflections(input: &[u8], secret: &[u8]) -> Vec<u8> {
 }
 
 fn decode_chunked_body(raw_chunked: &[u8]) -> Result<Vec<u8>, ProxyError> {
+    const MAX_TRAILER_LINES: usize = 64;
     let mut decoded = Vec::new();
     let mut cursor = 0usize;
 
@@ -456,7 +457,24 @@ fn decode_chunked_body(raw_chunked: &[u8]) -> Result<Vec<u8>, ProxyError> {
                 reason: "non-UTF-8 chunk size line",
             }
         })?;
-        let hex_part = size_line.split(';').next().unwrap_or("").trim();
+        if size_line
+            .bytes()
+            .any(|b| (b < 0x20 && b != b'\t') || b == 0x7F)
+        {
+            return Err(ProxyError::MalformedUpstreamResponse {
+                reason: "control character in chunk size line",
+            });
+        }
+        let hex_part = size_line
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| c == ' ' || c == '\t');
+        if hex_part.is_empty() || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ProxyError::MalformedUpstreamResponse {
+                reason: "invalid hexadecimal chunk size",
+            });
+        }
         let chunk_size = usize::from_str_radix(hex_part, 16).map_err(|_| {
             ProxyError::MalformedUpstreamResponse {
                 reason: "invalid hexadecimal chunk size",
@@ -491,6 +509,60 @@ fn decode_chunked_body(raw_chunked: &[u8]) -> Result<Vec<u8>, ProxyError> {
             });
         }
         cursor += 2;
+    }
+
+    // Require and validate trailer-section + terminating CRLF (`*( field-line CRLF ) CRLF`)
+    let mut trailer_count = 0usize;
+    loop {
+        let trailer_rest =
+            raw_chunked
+                .get(cursor..)
+                .ok_or(ProxyError::MalformedUpstreamResponse {
+                    reason: "missing terminating CRLF after last chunk",
+                })?;
+        let trailer_end = trailer_rest.windows(2).position(|w| w == b"\r\n").ok_or(
+            ProxyError::MalformedUpstreamResponse {
+                reason: "missing terminating CRLF after last chunk",
+            },
+        )?;
+        if trailer_end == 0 {
+            cursor += 2;
+            break;
+        }
+        trailer_count += 1;
+        if trailer_count > MAX_TRAILER_LINES {
+            return Err(ProxyError::MalformedUpstreamResponse {
+                reason: "excessive chunked trailer header lines",
+            });
+        }
+        let trailer_line = std::str::from_utf8(&trailer_rest[..trailer_end]).map_err(|_| {
+            ProxyError::MalformedUpstreamResponse {
+                reason: "non-UTF-8 chunked trailer line",
+            }
+        })?;
+        let (t_name, t_val) =
+            trailer_line
+                .split_once(':')
+                .ok_or(ProxyError::MalformedUpstreamResponse {
+                    reason: "malformed chunked trailer line",
+                })?;
+        if t_name.is_empty() || !t_name.bytes().all(is_tchar) {
+            return Err(ProxyError::MalformedUpstreamResponse {
+                reason: "invalid chunked trailer header name",
+            });
+        }
+        if t_val.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F) {
+            return Err(ProxyError::MalformedUpstreamResponse {
+                reason: "control byte in chunked trailer header value",
+            });
+        }
+        cursor += trailer_end + 2;
+    }
+
+    if cursor != raw_chunked.len() {
+        return Err(ProxyError::MalformedUpstreamResponse {
+            reason: "unparsed trailing bytes after chunked body terminator",
+        });
     }
 
     Ok(decoded)
@@ -551,6 +623,7 @@ fn parse_and_scrub_upstream_response(
     let scrubbed_reason_bytes = scrub_secret_reflections(raw_reason.as_bytes(), secret);
     let reason_phrase = sanitize_header_line_text(&scrubbed_reason_bytes);
 
+    let mut seen_transfer_encoding = false;
     let mut is_chunked = false;
     let mut upstream_content_length: Option<usize> = None;
     let mut sanitized_headers = Vec::new();
@@ -581,7 +654,13 @@ fn parse_and_scrub_upstream_response(
             continue;
         }
         if trimmed_name.eq_ignore_ascii_case("transfer-encoding") {
-            if trimmed_val.to_ascii_lowercase().contains("chunked") {
+            if seen_transfer_encoding {
+                return Err(ProxyError::MalformedUpstreamResponse {
+                    reason: "duplicate upstream Transfer-Encoding",
+                });
+            }
+            seen_transfer_encoding = true;
+            if trimmed_val.eq_ignore_ascii_case("chunked") {
                 is_chunked = true;
             } else {
                 return Err(ProxyError::MalformedUpstreamResponse {
@@ -669,38 +748,154 @@ pub trait UpstreamResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, ProxyError>> + Send + 'a>>;
 }
 
-const fn is_globally_routable_ipv4(v4: Ipv4Addr) -> bool {
+/// Returns `true` iff `v4` is a globally routable unicast IPv4 address outside all
+/// IANA / RFC 6890 special-purpose ranges.
+#[must_use]
+pub const fn is_globally_routable_ipv4(v4: Ipv4Addr) -> bool {
     let octets = v4.octets();
-    let is_cgnat = octets[0] == 100 && (octets[1] & 0xC0) == 64;
-    let is_benchmark = octets[0] == 198 && (octets[1] == 18 || octets[1] == 19);
-    !v4.is_loopback()
-        && !v4.is_private()
-        && !v4.is_link_local()
-        && !v4.is_broadcast()
-        && !v4.is_documentation()
-        && !v4.is_unspecified()
-        && !v4.is_multicast()
-        && !is_cgnat
-        && !is_benchmark
+    // 0.0.0.0/8 — "This host on this network" (RFC 1122 / RFC 791)
+    if octets[0] == 0 {
+        return false;
+    }
+    // 10.0.0.0/8 — Private-Use (RFC 1918)
+    if octets[0] == 10 {
+        return false;
+    }
+    // 100.64.0.0/10 — Shared Address Space / CGNAT (RFC 6598)
+    if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+        return false;
+    }
+    // 127.0.0.0/8 — Loopback (RFC 1122)
+    if octets[0] == 127 {
+        return false;
+    }
+    // 169.254.0.0/16 — Link-Local / Cloud IMDS (RFC 3927)
+    if octets[0] == 169 && octets[1] == 254 {
+        return false;
+    }
+    // 172.16.0.0/12 — Private-Use (RFC 1918)
+    if octets[0] == 172 && (octets[1] & 0xF0) == 16 {
+        return false;
+    }
+    // 192.0.0.0/24 — IETF Protocol Assignments (RFC 6890)
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        return false;
+    }
+    // 192.0.2.0/24 — Documentation TEST-NET-1 (RFC 5737)
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 2 {
+        return false;
+    }
+    // 192.88.99.0/24 — Deprecated 6to4 Relay Anycast (RFC 3068 / RFC 7526)
+    if octets[0] == 192 && octets[1] == 88 && octets[2] == 99 {
+        return false;
+    }
+    // 192.168.0.0/16 — Private-Use (RFC 1918)
+    if octets[0] == 192 && octets[1] == 168 {
+        return false;
+    }
+    // 198.18.0.0/15 — Network Interconnect Device Benchmark Testing (RFC 2544)
+    if octets[0] == 198 && (octets[1] & 0xFE) == 18 {
+        return false;
+    }
+    // 198.51.100.0/24 — Documentation TEST-NET-2 (RFC 5737)
+    if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
+        return false;
+    }
+    // 203.0.113.0/24 — Documentation TEST-NET-3 (RFC 5737)
+    if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
+        return false;
+    }
+    // 224.0.0.0/4 — Multicast (RFC 5771) and 240.0.0.0/4 — Reserved + Broadcast (RFC 1112 / RFC 919)
+    if octets[0] >= 224 {
+        return false;
+    }
+    true
 }
 
-fn is_globally_routable_ip(ip: IpAddr) -> bool {
+/// Returns `true` iff `ip` is a globally routable unicast IPv4 or IPv6 address
+/// outside all IANA / RFC 6890 special-purpose ranges.
+#[must_use]
+pub const fn is_globally_routable_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_globally_routable_ipv4(v4),
         IpAddr::V6(v6) => {
-            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
-                return is_globally_routable_ipv4(mapped_v4);
+            let segs = v6.segments();
+            // IPv4-mapped ::ffff:0:0/96 — delegate embedded IPv4 to full RFC 6890 filter
+            if segs[0] == 0
+                && segs[1] == 0
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0xffff
+            {
+                let hi = segs[6].to_be_bytes();
+                let lo = segs[7].to_be_bytes();
+                return is_globally_routable_ipv4(Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]));
             }
-            let seg0 = v6.segments()[0];
-            let is_unique_local = (seg0 & 0xfe00) == 0xfc00;
-            let is_link_local = (seg0 & 0xffc0) == 0xfe80;
-            let is_doc = seg0 == 0x2001 && v6.segments()[1] == 0x0db8;
-            !v6.is_loopback()
-                && !v6.is_unspecified()
-                && !v6.is_multicast()
-                && !is_unique_local
-                && !is_link_local
-                && !is_doc
+            // Unspecified ::/128, Loopback ::1/128, and deprecated IPv4-compatible ::/96
+            if segs[0] == 0
+                && segs[1] == 0
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0
+            {
+                return false;
+            }
+            // SIIT IPv4-translated ::ffff:0:0:0/96 (RFC 2765)
+            if segs[0] == 0
+                && segs[1] == 0
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0xffff
+                && segs[5] == 0
+            {
+                return false;
+            }
+            // RFC 6052 Well-Known NAT64 64:ff9b::/96
+            if segs[0] == 0x0064
+                && segs[1] == 0xff9b
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0
+            {
+                return false;
+            }
+            // RFC 8215 Local-Use NAT64 64:ff9b:1::/48
+            if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
+                return false;
+            }
+            // RFC 6666 Discard-Only 100::/64
+            if segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 {
+                return false;
+            }
+            // RFC 6890 IETF Protocol Assignments 2001::/23 (covers Teredo 2001:0000::/32,
+            // Benchmarking 2001:2::/48, ORCHID 2001:10::/28, and ORCHIDv2 2001:20::/28)
+            if segs[0] == 0x2001 && (segs[1] & 0xfe00) == 0x0000 {
+                return false;
+            }
+            // RFC 3849 Documentation 2001:db8::/32
+            if segs[0] == 0x2001 && segs[1] == 0x0db8 {
+                return false;
+            }
+            // RFC 3056 / RFC 7526 6to4 2002::/16
+            if segs[0] == 0x2002 {
+                return false;
+            }
+            // RFC 4193 Unique Local fc00::/7
+            if (segs[0] & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            // RFC 4291 Link-Local fe80::/10 and deprecated Site-Local fec0::/10
+            if (segs[0] & 0xffc0) == 0xfe80 || (segs[0] & 0xffc0) == 0xfec0 {
+                return false;
+            }
+            // RFC 4291 Multicast ff00::/8
+            if (segs[0] & 0xff00) == 0xff00 {
+                return false;
+            }
+            true
         }
     }
 }
@@ -1117,5 +1312,82 @@ mod tests {
                 reason: "compressed upstream Content-Encoding rejected"
             }
         ));
+    }
+
+    #[test]
+    fn rejects_duplicate_and_stacked_transfer_encoding_and_truncated_chunks() {
+        for raw_resp in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n2\r\nok\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: xchunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\nSMUGGLED"[..],
+        ] {
+            let err =
+                parse_and_scrub_upstream_response(raw_resp, b"sk-live-secret-999").unwrap_err();
+            assert!(matches!(err, ProxyError::MalformedUpstreamResponse { .. }));
+        }
+
+        // Valid chunked response with optional trailer + final CRLF succeeds and scrubs
+        let valid_chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED\r\n\r\n12\r\nsk-live-secret-999\r\n0\r\nX-Checksum: ok\r\n\r\n";
+        let ok = parse_and_scrub_upstream_response(valid_chunked, b"sk-live-secret-999").unwrap();
+        assert_eq!(ok.body, b"[REDACTED_BY_LOCKSMITH]");
+    }
+
+    #[test]
+    fn rfc6890_ip_filter_blocks_all_special_purpose_v4_and_v6_ranges() {
+        for blocked in [
+            "0.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "198.19.255.254",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::a9fe:a9fe",
+            "::ffff:169.254.169.254",
+            "::ffff:0:a9fe:a9fe",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001::1",
+            "2001:1ff::1",
+            "2001:db8::1",
+            "2002:a9fe:a9fe::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(!is_globally_routable_ip(ip), "{blocked} must be rejected");
+        }
+
+        for allowed in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "192.0.1.1",
+            "198.17.255.254",
+            "198.20.0.1",
+            "::ffff:1.1.1.1",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+        ] {
+            let ip: IpAddr = allowed.parse().unwrap();
+            assert!(is_globally_routable_ip(ip), "{allowed} must be accepted");
+        }
     }
 }

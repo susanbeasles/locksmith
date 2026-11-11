@@ -1026,3 +1026,296 @@ async fn redteam_transport_cid_spoof_port_pinning_and_policy_hash_mode_binding()
         "mutating guest_auth_mode MUST alter policy_hash so AEAD AAD unwrap fails"
     );
 }
+
+#[tokio::test]
+async fn redteam_upstream_stacked_duplicate_transfer_encoding_and_truncated_chunk_rejected() {
+    let pki = build_ephemeral_pki();
+    let engine = build_test_engine(
+        &pki.guest_a_cert_der,
+        &pki.guest_b_cert_der,
+        b"sk-live-secret-999",
+    );
+    let now_ms = 1_762_000_000_000u64;
+
+    let hostile_responses: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "stacked gzip, chunked",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+                .to_vec(),
+        ),
+        (
+            "stacked chunked, gzip",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+                .to_vec(),
+        ),
+        (
+            "unknown deflate transfer-coding",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: deflate\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+                .to_vec(),
+        ),
+        (
+            "substring xchunked bypass",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: xchunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+                .to_vec(),
+        ),
+        (
+            "duplicate Transfer-Encoding headers",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+                .to_vec(),
+        ),
+        (
+            "truncated 0\\r\\n without terminating \\r\\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n".to_vec(),
+        ),
+        (
+            "empty chunked stream missing final \\r\\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec(),
+        ),
+        (
+            "unparsed trailing smuggling bytes after chunked terminator",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nHTTP/1.1 200 Smuggled\r\n\r\n"
+                .to_vec(),
+        ),
+    ];
+
+    for (idx, (label, raw_resp)) in hostile_responses.into_iter().enumerate() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_cfg = Arc::clone(&pki.upstream_server_cfg);
+
+        let server_task = tokio::spawn(async move {
+            let (tcp, _) = upstream_listener.accept().await.unwrap();
+            let acceptor = TlsAcceptor::from(upstream_cfg);
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut req_buf = [0u8; 4096];
+            let _ = tls.read(&mut req_buf).await.unwrap();
+            tls.write_all(&raw_resp).await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let mut nonce = [0xB1u8; 32];
+        nonce[0] = u8::try_from(idx).unwrap();
+        let ticket = engine
+            .authorize_egress(EgressAuthorizationInput {
+                workload_id: "workload-a",
+                guest_cid: 10,
+                peer_cert_der: &pki.guest_a_cert_der,
+                sni_hostname: "api.anthropic.com",
+                port: 443,
+                nonce,
+                timestamp_ms: now_ms,
+                now_ms,
+                request: OutboundHttpRequest {
+                    method: "POST".to_owned(),
+                    path_and_query: "/v1/messages".to_owned(),
+                    headers: vec![("Host".to_owned(), "api.anthropic.com".to_owned())],
+                    body: Vec::new(),
+                },
+            })
+            .unwrap();
+
+        let resolver = StaticEndpointResolver::single("api.anthropic.com", 443, upstream_addr);
+        let res = splice_outbound_request(
+            ticket,
+            &resolver,
+            Arc::clone(&pki.proxy_to_upstream_client_cfg),
+            Duration::from_secs(2),
+        )
+        .await;
+        server_task.await.unwrap();
+
+        assert!(
+            matches!(res, Err(ProxyError::MalformedUpstreamResponse { .. })),
+            "hostile upstream chunked case ({label}) MUST fail closed with MalformedUpstreamResponse, got: {res:?}"
+        );
+    }
+
+    // Positive control: single case-insensitive `Transfer-Encoding: CHUNKED` with valid final CRLF succeeds
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_cfg = Arc::clone(&pki.upstream_server_cfg);
+    let ok_server = tokio::spawn(async move {
+        let (tcp, _) = upstream_listener.accept().await.unwrap();
+        let acceptor = TlsAcceptor::from(upstream_cfg);
+        let mut tls = acceptor.accept(tcp).await.unwrap();
+        let mut req_buf = [0u8; 4096];
+        let _ = tls.read(&mut req_buf).await.unwrap();
+        tls.write_all(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED\r\n\r\n5\r\nhello\r\n0\r\nX-Trailer: clean\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        tls.shutdown().await.unwrap();
+    });
+
+    let ok_ticket = engine
+        .authorize_egress(EgressAuthorizationInput {
+            workload_id: "workload-a",
+            guest_cid: 10,
+            peer_cert_der: &pki.guest_a_cert_der,
+            sni_hostname: "api.anthropic.com",
+            port: 443,
+            nonce: [0xBF; 32],
+            timestamp_ms: now_ms,
+            now_ms,
+            request: OutboundHttpRequest {
+                method: "POST".to_owned(),
+                path_and_query: "/v1/messages".to_owned(),
+                headers: vec![("Host".to_owned(), "api.anthropic.com".to_owned())],
+                body: Vec::new(),
+            },
+        })
+        .unwrap();
+    let resolver = StaticEndpointResolver::single("api.anthropic.com", 443, upstream_addr);
+    let sanitized = splice_outbound_request(
+        ok_ticket,
+        &resolver,
+        Arc::clone(&pki.proxy_to_upstream_client_cfg),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    ok_server.await.unwrap();
+    assert_eq!(sanitized.body, b"hello");
+}
+
+#[tokio::test]
+async fn redteam_rfc6890_special_purpose_ip_ranges_and_dns_resolver_rejection() {
+    use locksmith_proxy::{
+        is_globally_routable_ip, is_globally_routable_ipv4, SystemDnsResolver, UpstreamResolver,
+    };
+    use std::net::{IpAddr, Ipv4Addr};
+
+    // Every IANA / RFC 6890 non-global IPv4 special-purpose range
+    let forbidden_v4 = [
+        "0.0.0.0",         // 0.0.0.0/8 unspecified
+        "0.0.0.1",         // 0.0.0.0/8 "this network"
+        "0.255.255.255",   // 0.0.0.0/8 upper bound
+        "10.0.0.1",        // 10.0.0.0/8 RFC 1918
+        "100.64.0.1",      // 100.64.0.0/10 CGNAT start
+        "100.127.255.254", // 100.64.0.0/10 CGNAT end
+        "127.0.0.1",       // 127.0.0.0/8 loopback
+        "127.255.255.254", // 127.0.0.0/8 loopback end
+        "169.254.169.254", // 169.254.0.0/16 cloud IMDS / link-local
+        "172.16.0.1",      // 172.16.0.0/12 RFC 1918 start
+        "172.31.255.254",  // 172.16.0.0/12 RFC 1918 end
+        "192.0.0.1",       // 192.0.0.0/24 IETF protocol assignments
+        "192.0.0.9",       // 192.0.0.0/24 PCP anycast
+        "192.0.2.1",       // 192.0.2.0/24 TEST-NET-1
+        "192.88.99.1",     // 192.88.99.0/24 6to4 relay anycast
+        "192.168.1.1",     // 192.168.0.0/16 RFC 1918
+        "198.18.0.1",      // 198.18.0.0/15 benchmarking
+        "198.19.255.254",  // 198.18.0.0/15 benchmarking end
+        "198.51.100.1",    // 198.51.100.0/24 TEST-NET-2
+        "203.0.113.1",     // 203.0.113.0/24 TEST-NET-3
+        "224.0.0.1",       // 224.0.0.0/4 multicast
+        "239.255.255.250", // 224.0.0.0/4 multicast end
+        "240.0.0.1",       // 240.0.0.0/4 future reserved
+        "254.255.255.254", // 240.0.0.0/4 future reserved
+        "255.255.255.255", // 255.255.255.255/32 broadcast
+    ];
+    for ip_str in forbidden_v4 {
+        let v4: Ipv4Addr = ip_str.parse().unwrap();
+        assert!(
+            !is_globally_routable_ipv4(v4),
+            "non-global IPv4 {ip_str} MUST be rejected by is_globally_routable_ipv4"
+        );
+        assert!(
+            !is_globally_routable_ip(IpAddr::V4(v4)),
+            "non-global IPv4 {ip_str} MUST be rejected by is_globally_routable_ip"
+        );
+    }
+
+    // Every IANA / RFC 6890 non-global IPv6 special-purpose range
+    let forbidden_v6 = [
+        "::1",                                    // ::1/128 loopback
+        "::",                                     // ::/128 unspecified
+        "::ffff:169.254.169.254",                 // ::ffff:0:0/96 IPv4-mapped IMDS
+        "::ffff:0.0.0.1",                         // ::ffff:0:0/96 IPv4-mapped 0/8
+        "::ffff:240.0.0.1",                       // ::ffff:0:0/96 IPv4-mapped reserved
+        "::a9fe:a9fe",                            // ::/96 IPv4-compatible IMDS
+        "::8.8.8.8",          // ::/96 deprecated IPv4-compatible (upper 96 bits zero)
+        "::ffff:0:a9fe:a9fe", // ::ffff:0:0:0/96 SIIT IPv4-translated IMDS
+        "::ffff:0:0808:0808", // ::ffff:0:0:0/96 SIIT IPv4-translated
+        "64:ff9b::a9fe:a9fe", // 64:ff9b::/96 RFC 6052 Well-Known NAT64 IMDS
+        "64:ff9b::0808:0808", // 64:ff9b::/96 RFC 6052 Well-Known NAT64
+        "64:ff9b:1::1",       // 64:ff9b:1::/48 RFC 8215 Local-Use NAT64
+        "64:ff9b:1:ffff::a9fe:a9fe", // 64:ff9b:1::/48 RFC 8215 Local-Use NAT64
+        "100::1",             // 100::/64 RFC 6666 Discard-Only
+        "100::ffff:ffff:ffff:ffff", // 100::/64 Discard-Only upper bound
+        "2001::1",            // 2001::/23 Teredo (2001:0000::/32)
+        "2001:0:4136:e378:8000:63bf:3fff:fdd2", // 2001:0000::/32 Teredo sample
+        "2001:2::1",          // 2001::/23 Benchmarking (2001:2::/48)
+        "2001:20::1",         // 2001::/23 ORCHIDv2 (2001:20::/28)
+        "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", // 2001::/23 upper bound
+        "2001:db8::1",        // 2001:db8::/32 Documentation
+        "2002:a9fe:a9fe::1",  // 2002::/16 6to4 IMDS
+        "2002:0808:0808::1",  // 2002::/16 6to4
+        "fc00::1",            // fc00::/7 Unique Local
+        "fd12:3456:789a::1",  // fc00::/7 Unique Local
+        "fe80::1",            // fe80::/10 Link-Local
+        "febf:ffff::1",       // fe80::/10 Link-Local upper bound
+        "ff02::1",            // ff00::/8 Multicast
+        "ff0e::1",            // ff00::/8 Global-scope Multicast
+    ];
+    for ip_str in forbidden_v6 {
+        let ip: IpAddr = ip_str.parse().unwrap();
+        assert!(
+            !is_globally_routable_ip(ip),
+            "non-global IPv6 {ip_str} MUST be rejected by is_globally_routable_ip"
+        );
+    }
+
+    // Positive controls: adjacent global unicast IPv4 & IPv6 addresses MUST remain allowed
+    let global_controls = [
+        "1.1.1.1",
+        "8.8.8.8",
+        "93.184.216.34",
+        "100.63.255.255",
+        "100.128.0.1",
+        "172.15.255.255",
+        "172.32.0.1",
+        "192.0.1.1",
+        "192.88.98.1",
+        "198.17.255.255",
+        "198.20.0.1",
+        "::ffff:93.184.216.34",
+        "2001:200::1",
+        "2001:4860:4860::8888",
+        "2606:4700:4700::1111",
+    ];
+    for ip_str in global_controls {
+        let ip: IpAddr = ip_str.parse().unwrap();
+        assert!(
+            is_globally_routable_ip(ip),
+            "global unicast address {ip_str} MUST be accepted"
+        );
+    }
+
+    // End-to-end SystemDnsResolver rejection across special-purpose literals
+    let resolver = SystemDnsResolver;
+    for ssrf_target in [
+        "0.0.0.1",
+        "127.0.0.1",
+        "169.254.169.254",
+        "192.0.0.1",
+        "192.88.99.1",
+        "240.0.0.1",
+        "64:ff9b::a9fe:a9fe",
+        "64:ff9b:1::1",
+        "::ffff:0:a9fe:a9fe",
+        "::a9fe:a9fe",
+        "100::1",
+        "2001::1",
+        "2002:a9fe:a9fe::1",
+    ] {
+        let err = resolver
+            .resolve_upstream(ssrf_target, 443)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProxyError::Policy(PolicyError::TargetNotAllowed)),
+            "SystemDnsResolver MUST reject SSRF target {ssrf_target} with TargetNotAllowed, got: {err:?}"
+        );
+    }
+}

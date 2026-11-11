@@ -59,7 +59,7 @@ flowchart LR
 
 ## 2. Cryptographic Architecture & Domain Separation (`anvil-core`)
 
-All cryptographic operations use `aws-lc-rs = "1.18"` and `blake3 = "1.5"`. All secret buffers wrap `zeroize::Zeroizing`.
+All cryptographic operations use exact-locked `aws-lc-rs = "=1.19.0"` (`default-features = false, features = ["aws-lc-sys", "alloc"]`) and `blake3 = "=1.8.7"`. All secret buffers wrap `zeroize::Zeroizing`.
 
 ### 2.1 Canonical Length-Prefixed HKDF-SHA256 (`anvil_core::kdf`)
 
@@ -122,19 +122,19 @@ Encoded using the exact length-prefixed format:
 6. Open `ciphertext_and_tag` using `aws_lc_rs::aead::LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &*kek)?)` with `Nonce::try_assume_unique_for_key(&envelope.nonce)` and `Aad::from(&aad_bytes)`.
 7. On any tag, ciphertext, nonce, share, or AAD mismatch, zeroize intermediate buffers and return `Err(CryptoError::AuthenticationFailed)` with zero partial plaintext returned.
 8. Wrap plaintext in `SecretBytes(Zeroizing<Vec<u8>>)`, whose `fmt::Debug` and `fmt::Display` unconditionally emit `"SecretBytes([REDACTED])"`.
-9. Production compilation enforces `#[cfg(all(feature = "prod-strict", feature = "test-hsm"))] compile_error!(...)` so `SoftwareTestHsm` can never be linked into production binaries.
+9. Production compilation enforces `#[cfg(all(feature = "prod-strict", feature = "test-hsm"))] compile_error!(...)` so `SoftwareTestHsm` can never be linked into production binaries. Startup Known-Answer Tests (`verify-self`) exercise the real `SecretUnwrapper` pipeline via `KatChallengeBoundUnwrapper`, which responds exclusively to the single precomputed KAT hardware challenge (`KAT_EXPECTED_HW_CHALLENGE`) and rejects every other input with `CryptoError::HardwareFailure`.
 
 ### 2.4 Concurrency-Safe Single-Use Nonce Filter (`anvil_core::replay`)
 
 - Each privileged operation supplies `(nonce: [u8; 32], timestamp_ms: u64)` evaluated against a monotonically non-decreasing clock (`ReplayFilter::monotonic_now_ms()` anchored to `std::time::Instant` so NTP backward steps cannot replay nonces).
-- **Freshness Check:** Given monotonic `effective_now_ms`, reject `timestamp_ms` with `ReplayError::TimestampExpired` if `effective_now_ms.saturating_sub(timestamp_ms) > skew_window_ms` or `ReplayError::TimestampInFuture` if `timestamp_ms.saturating_sub(effective_now_ms) > skew_window_ms` (default `skew_window_ms = 30_000` ms = `+-30s`).
+- **Clock-Domain Isolation:** `last_now_ms: AtomicU64` is updated exclusively by `monotonic_now_ms()`; caller-supplied `now_ms` arguments to `check_and_burn` / `check_and_burn_at` use an isolated expiry queue (`explicit_order`) and never advance `last_now_ms` or evict `system_order` nonces.
+- **Freshness Check:** Given `effective_now_ms`, reject `timestamp_ms` with `ReplayError::TimestampExpired` if `effective_now_ms.saturating_sub(timestamp_ms) > skew_window_ms` or `ReplayError::TimestampInFuture` if `timestamp_ms.saturating_sub(effective_now_ms) > skew_window_ms` (default `skew_window_ms = 30_000` ms = `+-30s`).
 - **Atomic Burn & Future-Pinned Eviction Immunity:**
-  1. Acquire internal mutex lock over `(HashMap<[u8; 32], u64>, VecDeque<([u8; 32], u64)>, last_now_ms)`.
-  2. Clamp `effective_now_ms = now_ms.max(last_now_ms)`.
-  3. Purge front queue entries whose monotonic expiry (`front_expires_at = recorded_now_ms + 2 * skew_window_ms`, i.e., full `60s` validity span) satisfies `front_expires_at <= effective_now_ms`, removing `front_nonce` from `burned` **only** when `burned.get(&front_nonce) == Some(&front_expires_at)`.
-  4. If `nonce` is already present in the live map, immediately return `Err(ReplayError::NonceAlreadyBurned)`.
-  5. If either `burned.len() >= max_entries` or `order.len() >= max_entries`, fail closed with `Err(ReplayError::CapacityExceeded)`—**never** evict an unexpired nonce.
-  6. Insert `expires_at_ms = effective_now_ms + 2 * skew_window_ms` into both `burned` and `order` and return `Ok(())`.
+  1. Acquire internal mutex lock over `(HashMap<[u8; 32], (ClockDomain, u64)>, system_order, explicit_order)`.
+  2. Purge front queue entries in the active `ClockDomain` whose expiry (`front_expires_at = recorded_now_ms + 2 * skew_window_ms`, i.e., full `60s` validity span) satisfies `front_expires_at <= effective_now_ms`, removing `front_nonce` from `burned` **only** when `burned.get(&front_nonce) == Some(&(domain, front_expires_at))`.
+  3. If `nonce` is already present in the live map, immediately return `Err(ReplayError::NonceAlreadyBurned)`.
+  4. If `burned.len() >= max_entries` or `(system_order.len() + explicit_order.len()) >= max_entries`, fail closed with `Err(ReplayError::CapacityExceeded)`—**never** evict an unexpired nonce.
+  5. Insert `(domain, expires_at_ms)` into `burned` and the domain's queue and return `Ok(())`.
 
 ### 2.5 Append-Only `BLAKE3` Audit Ledger (`anvil_core::ledger`)
 
@@ -285,9 +285,9 @@ pub struct ApprovedEgressTicket {
 
 ### 5.3 TLS 1.3 Splicing, SSRF Guard & Reflection Scrubber (`splicer.rs`)
 
-1. Resolves `(verified_sni, verified_port)` via `UpstreamResolver`, rejecting loopback, RFC 1918 private, link-local/metadata (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`), multicast, unspecified, and IPv4-mapped non-global IPv6 addresses (`SystemDnsResolver`), and constructs `rustls::pki_types::ServerName::try_from(ticket.verified_sni())`.
+1. Resolves `(verified_sni, verified_port)` via `UpstreamResolver`, enforcing the full IANA / RFC 6890 non-global address filter (`is_globally_routable_ip` / `is_globally_routable_ipv4`): rejecting IPv4 `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` (CGNAT), `127.0.0.0/8`, `169.254.0.0/16` (link-local/IMDS), `172.16.0.0/12`, `192.0.0.0/24` (IETF protocol assignments), `192.0.2.0/24`, `192.88.99.0/24` (6to4 relay anycast), `192.168.0.0/16`, `198.18.0.0/15` (benchmarking), `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4` (multicast), and `240.0.0.0/4` (reserved/broadcast); and IPv6 `::`, `::1`, `::/96` (IPv4-compatible), `::ffff:0:0/96` (IPv4-mapped non-global), `::ffff:0:0:0/96` (SIIT), `64:ff9b::/96` and `64:ff9b:1::/48` (NAT64), `100::/64` (discard-only), `2001::/23` (IETF protocol assignments / Teredo), `2001:db8::/32`, `2002::/16` (6to4), `fc00::/7`, `fe80::/10` (`fec0::/10`), and `ff00::/8` (`SystemDnsResolver`), and constructs `rustls::pki_types::ServerName::try_from(ticket.verified_sni())`.
 2. Negotiates outbound TLS 1.3 (`rustls` with `tls12` disabled at compile time and `aws_lc_rs` crypto provider) and writes the canonical request head + injected secret header + body directly into the encrypted TLS stream. Zeroizing secret header buffers are dropped immediately after `flush()`.
-3. Reads at most `MAX_UPSTREAM_RESPONSE_BYTES` (`16 MiB`), rejects non-`identity` `Content-Encoding`, and passes status reason, header values, and body bytes through a single-pass `scrub_secret_reflections()` scanner:
+3. Reads at most `MAX_UPSTREAM_RESPONSE_BYTES` (`16 MiB`), rejects non-`identity` `Content-Encoding`, duplicate `Transfer-Encoding` headers, and any stacked or unknown `Transfer-Encoding` value (`!trimmed_val.eq_ignore_ascii_case("chunked")`), validates the terminating trailer/final `\r\n` boundary (with zero trailing smuggling bytes) when decoding chunked bodies, and passes status reason, header values, and body bytes through a single-pass `scrub_secret_reflections()` scanner:
    - Replaces every raw byte occurrence, uppercase/lowercase percent-encoded form, and `0`, `1`, and `2 mod 3` byte-offset standard/URL-safe Base64 encoding (including boundary nibbles and `=` padding) of `raw_secret` with `b"[REDACTED_BY_LOCKSMITH]"` without self-matching.
    - Recomputes `Content-Length` (re-framing `Transfer-Encoding: chunked` into exact `Content-Length`) so Ring 2 receives a well-formed, completely redacted HTTP/1.1 response.
 

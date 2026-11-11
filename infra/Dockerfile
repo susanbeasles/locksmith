@@ -41,7 +41,7 @@ RUN cargo build --locked --release -p locksmith-daemon --features prod-strict \
 # -----------------------------------------------------------------------------
 # Stage 2: Immutable Non-Root Distroless Runtime (`--read-only` compatible)
 # -----------------------------------------------------------------------------
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:6714977f9f02632c31377650c15d89a7efaebf43bab0f37c712c30fc01edb973 AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 
 COPY --from=builder --chown=0:0 --chmod=0555 /usr/local/bin/locksmith-daemon /usr/local/bin/locksmith-daemon
 

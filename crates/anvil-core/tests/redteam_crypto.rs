@@ -344,3 +344,88 @@ fn redteam_oversized_envelope_rejected_and_bounded_ledger_retention() {
         .verify_all()
         .expect("bounded AuditLedger must verify retained chain against anchor hash");
 }
+
+#[test]
+fn redteam_deterministic_unwrap_kat_and_challenge_bound_adapter() {
+    use anvil_core::unwrap::{
+        verify_deterministic_unwrap_kat, HardwareUnwrapper, KatChallengeBoundUnwrapper,
+        KAT_EXPECTED_CIPHERTEXT_AND_TAG, KAT_EXPECTED_HW_CHALLENGE, KAT_GUEST_CID, KAT_HOST_SHARE,
+        KAT_PLAINTEXT, KAT_POLICY_HASH, KAT_SECRET_ID,
+    };
+
+    // 1. Deterministic KAT function exercises SecretUnwrapper directly and reproduces exact RFC vector
+    let kat_env = verify_deterministic_unwrap_kat().unwrap();
+    assert_eq!(
+        kat_env.ciphertext_and_tag.as_slice(),
+        KAT_EXPECTED_CIPHERTEXT_AND_TAG.as_slice(),
+        "KAT envelope ciphertext_and_tag must match precomputed RFC 8439 vector byte-for-byte"
+    );
+
+    // 2. Direct SecretUnwrapper::unwrap_envelope with KatChallengeBoundUnwrapper recovers exact plaintext
+    let unwrapper = SecretUnwrapper::new(
+        HostShare::from_bytes(KAT_HOST_SHARE),
+        KatChallengeBoundUnwrapper,
+    );
+    let kat_aad = UnwrapAad {
+        secret_id: KAT_SECRET_ID,
+        policy_hash: KAT_POLICY_HASH,
+        guest_cid: KAT_GUEST_CID,
+    };
+    let opened = unwrapper.unwrap_envelope(&kat_env, &kat_aad).unwrap();
+    assert_eq!(opened.expose_secret(), KAT_PLAINTEXT);
+
+    // 3. KatChallengeBoundUnwrapper MUST reject every non-KAT challenge so it can NEVER act as a mock HSM
+    let adapter = KatChallengeBoundUnwrapper;
+    assert!(adapter
+        .derive_hardware_share(&KAT_EXPECTED_HW_CHALLENGE)
+        .is_ok());
+    for bit in 0..256usize {
+        let mut wrong_chal = KAT_EXPECTED_HW_CHALLENGE;
+        wrong_chal[bit / 8] ^= 1u8 << (bit % 8);
+        assert_eq!(
+            adapter.derive_hardware_share(&wrong_chal).unwrap_err(),
+            CryptoError::HardwareFailure,
+            "KatChallengeBoundUnwrapper must fail closed on bit flip {bit}"
+        );
+    }
+    assert_eq!(
+        adapter.derive_hardware_share(b"arbitrary").unwrap_err(),
+        CryptoError::HardwareFailure
+    );
+    // Attempting a random seal with KatChallengeBoundUnwrapper must also fail closed
+    assert!(unwrapper.seal(b"arbitrary-secret", &kat_aad).is_err());
+}
+
+#[test]
+fn redteam_explicit_check_and_burn_cannot_poison_monotonic_system_clock() {
+    let filter = ReplayFilter::with_defaults(128).unwrap();
+
+    // 1. Burn a real-time nonce via Instant-anchored check_and_burn_system_time
+    let sys_t0 = filter.monotonic_now_ms();
+    let sys_nonce = [0x51; 32];
+    filter
+        .check_and_burn_system_time(sys_nonce, sys_t0)
+        .unwrap();
+
+    // 2. Call explicit check_and_burn with a far-future synthetic caller timestamp (year ~2255)
+    let far_future_ms = 9_000_000_000_000u64;
+    filter
+        .check_and_burn([0x52; 32], far_future_ms, far_future_ms)
+        .unwrap();
+
+    // 3. Previously burned system-time nonce MUST NOT have been prematurely evicted by far_future_ms
+    assert_eq!(
+        filter
+            .check_and_burn_system_time(sys_nonce, sys_t0)
+            .unwrap_err(),
+        ReplayError::NonceAlreadyBurned,
+        "explicit check_and_burn now_ms must never evict live system-time nonces"
+    );
+
+    // 4. Subsequent legitimate system-time requests MUST NOT be poisoned with TimestampExpired
+    let sys_t1 = filter.monotonic_now_ms();
+    assert!(
+        filter.check_and_burn_system_time([0x53; 32], sys_t1).is_ok(),
+        "explicit check_and_burn now_ms must never poison monotonic_now_ms / check_and_burn_system_time"
+    );
+}

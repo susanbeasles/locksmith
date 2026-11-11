@@ -25,14 +25,14 @@ Every crate in the Cargo workspace MUST inherit `[lints] workspace = true` enfor
 - `clippy.dbg_macro = "deny"`
 - **Test Assertion Exception:** Unit and adversarial test modules (`#[cfg(test)]` or `tests/*.rs`) may place `#[allow(clippy::unwrap_used, clippy::expect_used)]` strictly on test modules/functions for concise test assertions—never inside non-test library or daemon targets.
 - **Zero Stubs or Mock Crypto in Production:** Non-test compilation profiles MUST NOT contain `todo!()`, `unimplemented!()`, dummy return values, or software mock HSMs (`SoftwareTestHsm` MUST remain gated behind `#[cfg(any(test, feature = "test-hsm"))]`).
-- **Pinned Cryptographic & Runtime Stack:**
-  - `aws-lc-rs = "1.18"` (HKDF-SHA256, ChaCha20-Poly1305 AEAD, SHA-256, constant-time comparison)
-  - `rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }` + `tokio-rustls`
-  - `tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }`
-  - `tokio-vsock = "0.7.3"` (gated under `#[cfg(target_os = "linux")]`)
-  - `rustix = { version = "0.38", features = ["fs", "process", "net"] }`
-  - `blake3 = "1.5"`
-  - `zeroize = { version = "1.8", features = ["derive"] }`
+- **Pinned Cryptographic & Runtime Stack (`=x.y.z` exact version locks in `Cargo.toml`):**
+  - `aws-lc-rs = { version = "=1.19.0", default-features = false, features = ["aws-lc-sys", "alloc"] }` (HKDF-SHA256, ChaCha20-Poly1305 AEAD, SHA-256, constant-time comparison)
+  - `rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }` + `tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs"] }` (strictly TLS 1.3 only; `tls12` disabled at compile time)
+  - `tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }`
+  - `tokio-vsock = "=0.7.3"` (gated under `#[cfg(target_os = "linux")]`)
+  - `rustix = { version = "=0.38.44", features = ["fs", "process", "net"] }`
+  - `blake3 = "=1.8.7"`
+  - `zeroize = { version = "=1.9.1", features = ["derive"] }`
 
 ---
 

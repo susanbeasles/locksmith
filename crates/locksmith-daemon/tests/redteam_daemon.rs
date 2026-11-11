@@ -61,6 +61,30 @@ fn redteam_verify_self_binary_enforces_nondumpable_and_passes_kats() {
         "verify-self exited non-zero: stdout={stdout}, stderr={stderr}"
     );
     assert!(stdout.contains("locksmith-daemon verify-self: OK (nondumpable=true"));
+
+    // Second invocation must produce byte-identical deterministic output
+    let output_repeat = Command::new(bin)
+        .env_clear()
+        .arg("verify-self")
+        .output()
+        .unwrap();
+    assert_eq!(output.stdout, output_repeat.stdout);
+
+    // Static invariant: selftest.rs must invoke SecretUnwrapper directly with deterministic KAT vectors
+    // (zero rand::fill and zero hand-rolled LessSafeKey AEAD inside selftest.rs)
+    let selftest_src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/selftest.rs"),
+    )
+    .unwrap();
+    assert!(
+        !selftest_src.contains("rand::fill") && !selftest_src.contains("LessSafeKey"),
+        "selftest.rs must use deterministic KAT inputs calling SecretUnwrapper directly"
+    );
+    assert!(
+        selftest_src.contains("SecretUnwrapper")
+            && selftest_src.contains("verify_deterministic_unwrap_kat"),
+        "selftest.rs must exercise anvil_core::unwrap::SecretUnwrapper and verify_deterministic_unwrap_kat"
+    );
 }
 
 #[test]
@@ -585,12 +609,26 @@ guest_auth_mode = "reject"
     {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
-        // 1. Symlink to policy file MUST be rejected via O_NOFOLLOW
+        // 1. Symlink to policy file MUST be rejected via O_NOFOLLOW / NO_SYMLINKS
         let symlink_policy = dir.join("policy-link.conf");
         symlink(&valid_policy_path, &symlink_policy).unwrap();
         assert!(
             load_policy_file(&symlink_policy).is_err(),
             "load_policy_file must reject symlink policy paths"
+        );
+
+        // 1b. Regular policy file reached via an intermediate symlinked parent directory MUST be rejected on Linux
+        let real_subdir = dir.join("real-conf-dir");
+        std::fs::create_dir_all(&real_subdir).unwrap();
+        let nested_policy = real_subdir.join("nested-policy.conf");
+        std::fs::write(&nested_policy, &policy_text).unwrap();
+        std::fs::set_permissions(&nested_policy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let symlink_subdir = dir.join("symlink-conf-dir");
+        symlink(&real_subdir, &symlink_subdir).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(
+            load_policy_file(&symlink_subdir.join("nested-policy.conf")).is_err(),
+            "load_policy_file on Linux must reject intermediate symlinked parent directories via openat2(NO_SYMLINKS)"
         );
 
         // 2. World-writable (0666) policy file MUST be rejected on Linux
@@ -884,6 +922,37 @@ fn redteam_forge_controller_rejects_injection_floating_tags_and_traversal() {
     assert!(
         forge_src.contains("op read --"),
         "infra/forge must pass `--` end-of-options to `op read`"
+    );
+    assert!(
+        forge_src.contains("trap cleanup_remote EXIT INT TERM HUP"),
+        "infra/forge remote verifier must trap HUP alongside EXIT INT TERM so SSH disconnects wipe tmpfs DOCKER_CONFIG"
+    );
+
+    // 1b. Static invariants on infra/Dockerfile, .github/workflows/ci-and-sign.yml, and AGENTS.md
+    let dockerfile_src = std::fs::read_to_string(workspace_root.join("infra/Dockerfile")).unwrap();
+    assert!(
+        dockerfile_src.contains(
+            "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime"
+        ) && dockerfile_src.contains("USER 65532:65532"),
+        "infra/Dockerfile must pin the exact cc-debian12:nonroot manifest digest and explicit USER 65532:65532"
+    );
+
+    let ci_src =
+        std::fs::read_to_string(workspace_root.join(".github/workflows/ci-and-sign.yml")).unwrap();
+    assert!(
+        ci_src.contains("dtolnay/rust-toolchain@ccc8c1f930153b792217f06c65a38f23a882993a")
+            && ci_src.contains("cargo +1.85.1 check --workspace --all-targets --locked")
+            && ci_src.contains("docker-verify:")
+            && ci_src.contains("file: infra/Dockerfile"),
+        "ci-and-sign.yml must enforce MSRV 1.85.1 and PR/branch Dockerfile build+verify gates"
+    );
+
+    let agents_src = std::fs::read_to_string(workspace_root.join("AGENTS.md")).unwrap();
+    assert!(
+        agents_src.contains("version = \"=1.19.0\"")
+            && agents_src.contains("version = \"=0.23.46\"")
+            && !agents_src.contains("\"tls12\""),
+        "AGENTS.md §2 must match Cargo.toml exact =x.y.z versions and TLS 1.3-only rustls features"
     );
 
     // 2. Dynamic adversarial CLI validation harness with canary stubs for ssh/install/op

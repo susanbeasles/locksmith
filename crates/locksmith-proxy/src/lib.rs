@@ -13,8 +13,9 @@ pub use policy::{
     OutboundHttpRequest, PolicyEngine, WorkloadIdentity, MIN_INJECTED_SECRET_BYTES,
 };
 pub use splicer::{
-    handle_mtls_guest_connection, scrub_secret_reflections, splice_outbound_request,
-    MtlsProxyRequest, MtlsProxySession, SanitizedHttpResponse, StaticEndpointResolver,
-    SystemDnsResolver, UpstreamResolver, SCRUB_REPLACEMENT_TOKEN,
+    handle_mtls_guest_connection, is_globally_routable_ip, is_globally_routable_ipv4,
+    scrub_secret_reflections, splice_outbound_request, MtlsProxyRequest, MtlsProxySession,
+    SanitizedHttpResponse, StaticEndpointResolver, SystemDnsResolver, UpstreamResolver,
+    SCRUB_REPLACEMENT_TOKEN,
 };
 pub use ticket::ApprovedEgressTicket;

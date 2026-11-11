@@ -183,14 +183,19 @@ fn unquote_policy_value(raw: &str) -> Result<String, DaemonError> {
 fn read_confined_policy_text(path: &Path) -> Result<Zeroizing<String>, DaemonError> {
     #[cfg(target_os = "linux")]
     let file = {
-        use rustix::fs::{fstat, openat, FileType, Mode, OFlags, CWD};
-        let fd = openat(
+        use rustix::fs::{fstat, openat2, FileType, Mode, OFlags, ResolveFlags, CWD};
+        let fd = openat2(
             CWD,
             path,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
+            ResolveFlags::NO_SYMLINKS,
         )
-        .map_err(|_| DaemonError::Io("failed to open policy file with O_NOFOLLOW".to_owned()))?;
+        .map_err(|_| {
+            DaemonError::Io(
+                "failed to open policy file with openat2(RESOLVE_NO_SYMLINKS)".to_owned(),
+            )
+        })?;
         let st = fstat(&fd)
             .map_err(|_| DaemonError::Io("failed to stat policy file descriptor".to_owned()))?;
         if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
