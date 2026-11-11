@@ -21,8 +21,8 @@ pub const SCRUB_REPLACEMENT_TOKEN: &[u8] = b"[REDACTED_BY_LOCKSMITH]";
 /// Maximum inner mTLS proxy request envelope size (`512 KiB`).
 pub const MAX_MTLS_ENVELOPE_BYTES: usize = 524_288;
 
-/// Maximum upstream HTTP response size buffered in Ring 1 (`4 MiB`).
-pub const MAX_UPSTREAM_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum upstream HTTP response size buffered in Ring 1 (`16 MiB`).
+pub const MAX_UPSTREAM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 const PROXY_MAGIC: [u8; 4] = *b"LKPX";
 const PROXY_VERSION: u8 = 1;
@@ -582,23 +582,8 @@ pub async fn splice_outbound_request(
                 .await
                 .map_err(|e| ProxyError::TransportError(e.to_string()))?;
 
-            let mut resp_buf = Vec::with_capacity(4096);
-            let mut chunk = [0u8; 8192];
-            loop {
-                let n = tls
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|e| ProxyError::TransportError(e.to_string()))?;
-                if n == 0 {
-                    break;
-                }
-                if resp_buf.len().saturating_add(n) > MAX_UPSTREAM_RESPONSE_BYTES {
-                    return Err(ProxyError::MalformedUpstreamResponse {
-                        reason: "upstream HTTP response exceeded size cap",
-                    });
-                }
-                resp_buf.extend_from_slice(&chunk[..n]);
-            }
+            let resp_buf =
+                read_bounded_upstream_response(&mut tls, MAX_UPSTREAM_RESPONSE_BYTES).await?;
 
             Ok::<ConsumedSpliceOutcome, ProxyError>(ConsumedSpliceOutcome(
                 resp_buf,
@@ -609,6 +594,30 @@ pub async fn splice_outbound_request(
         .map_err(|_| ProxyError::Timeout)??;
 
     parse_and_scrub_upstream_response(&raw_resp, raw_secret.expose_secret())
+}
+
+async fn read_bounded_upstream_response<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ProxyError> {
+    let mut resp_buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|e| ProxyError::TransportError(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        if resp_buf.len().saturating_add(n) > max_bytes {
+            return Err(ProxyError::MalformedUpstreamResponse {
+                reason: "upstream HTTP response exceeded size cap",
+            });
+        }
+        resp_buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(resp_buf)
 }
 
 struct ConsumedSpliceOutcome(Vec<u8>, anvil_core::unwrap::SecretBytes);
@@ -725,5 +734,19 @@ mod tests {
         assert!(!scrubbed_str.contains(std::str::from_utf8(&pct).unwrap()));
         assert!(!scrubbed_str.contains(std::str::from_utf8(&b64).unwrap()));
         assert_eq!(scrubbed_str.matches("[REDACTED_BY_LOCKSMITH]").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_upstream_response_before_reflection_scrubbing() {
+        let (mut writer, mut reader) = tokio::io::duplex(65_536);
+        tokio::spawn(async move {
+            let oversized = vec![b'A'; 32_769];
+            let _ = writer.write_all(&oversized).await;
+        });
+
+        let err = read_bounded_upstream_response(&mut reader, 32_768)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProxyError::MalformedUpstreamResponse { .. }));
     }
 }

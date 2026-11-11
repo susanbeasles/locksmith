@@ -19,21 +19,55 @@ pub struct LedgerEventInput<'a> {
     pub summary: &'a str,
 }
 
+fn validate_field_len(field_name: &'static str, value: &str) -> Result<u16, LedgerError> {
+    if value.is_empty() {
+        return Err(LedgerError::EmptyField { field: field_name });
+    }
+    u16::try_from(value.len()).map_err(|_| LedgerError::FieldTooLarge {
+        field: field_name,
+        len: value.len(),
+    })
+}
+
 fn validate_and_frame_field(
     out: &mut Vec<u8>,
     field_name: &'static str,
     value: &str,
 ) -> Result<(), LedgerError> {
-    if value.is_empty() {
-        return Err(LedgerError::EmptyField { field: field_name });
-    }
-    let len_u16 = u16::try_from(value.len()).map_err(|_| LedgerError::FieldTooLarge {
-        field: field_name,
-        len: value.len(),
-    })?;
+    let len_u16 = validate_field_len(field_name, value)?;
     out.extend_from_slice(&len_u16.to_be_bytes());
     out.extend_from_slice(value.as_bytes());
     Ok(())
+}
+
+fn stream_field_to_hasher(
+    hasher: &mut blake3::Hasher,
+    field_name: &'static str,
+    value: &str,
+) -> Result<(), LedgerError> {
+    let len_u16 = validate_field_len(field_name, value)?;
+    hasher.update(&len_u16.to_be_bytes());
+    hasher.update(value.as_bytes());
+    Ok(())
+}
+
+fn stream_entry_hash(
+    prev_hash: &[u8; 32],
+    sequence: u64,
+    timestamp_ms: u64,
+    kind: &str,
+    actor: &str,
+    summary: &str,
+) -> Result<[u8; 32], LedgerError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prev_hash);
+    hasher.update(LEDGER_DOMAIN_TAG);
+    hasher.update(&sequence.to_be_bytes());
+    hasher.update(&timestamp_ms.to_be_bytes());
+    stream_field_to_hasher(&mut hasher, "kind", kind)?;
+    stream_field_to_hasher(&mut hasher, "actor", actor)?;
+    stream_field_to_hasher(&mut hasher, "summary", summary)?;
+    Ok(*hasher.finalize().as_bytes())
 }
 
 fn encode_canonical_event(
@@ -80,7 +114,8 @@ impl LedgerEntry {
         )
     }
 
-    /// Computes `BLAKE3(prev_hash || canonical_event_bytes)`.
+    /// Computes `BLAKE3(prev_hash || canonical_event_bytes)` by streaming directly
+    /// into `blake3::Hasher::update` without heap-allocating a concatenated buffer.
     #[must_use]
     pub fn compute_entry_hash(prev_hash: &[u8; 32], canonical_event_bytes: &[u8]) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
@@ -127,14 +162,14 @@ impl AuditLedger {
             u64::try_from(guard.entries.len()).map_err(|_| LedgerError::StateCorrupted)?;
         let prev_hash = guard.head_hash;
 
-        let canonical_bytes = encode_canonical_event(
+        let entry_hash = stream_entry_hash(
+            &prev_hash,
             sequence,
             event.timestamp_ms,
             event.kind,
             event.actor,
             event.summary,
         )?;
-        let entry_hash = LedgerEntry::compute_entry_hash(&prev_hash, &canonical_bytes);
 
         let entry = LedgerEntry {
             sequence,
@@ -200,8 +235,14 @@ impl AuditLedger {
                 });
             }
 
-            let canonical = entry.canonical_event_bytes()?;
-            let recomputed = LedgerEntry::compute_entry_hash(&entry.prev_hash, &canonical);
+            let recomputed = stream_entry_hash(
+                &entry.prev_hash,
+                entry.sequence,
+                entry.timestamp_ms,
+                &entry.kind,
+                &entry.actor,
+                &entry.summary,
+            )?;
             if verify_slices_are_equal(&entry.entry_hash, &recomputed).is_err() {
                 return Err(LedgerError::EntryHashTampered {
                     sequence: entry.sequence,
