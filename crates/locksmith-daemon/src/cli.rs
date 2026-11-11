@@ -20,8 +20,14 @@ pub enum CliCommand {
         ring0_uid: u32,
         allowed_peer_uid: u32,
         mapped_guest_cid: u32,
+        policy_file: Option<PathBuf>,
+        vsock_port: Option<u32>,
+        max_connections: usize,
     },
 }
+
+/// Default bounded concurrent IPC/mTLS connection limit for `BrokerDaemon`.
+pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 128;
 
 /// Parses CLI arguments without ever echoing raw argument values in error messages.
 pub fn parse_cli_args<I>(args: I) -> Result<CliCommand, DaemonError>
@@ -68,6 +74,9 @@ where
     let mut ring0_uid: u32 = 0;
     let mut allowed_peer_uid: u32 = 0;
     let mut mapped_guest_cid: u32 = 3;
+    let mut policy_file: Option<PathBuf> = None;
+    let mut vsock_port: Option<u32> = None;
+    let mut max_connections: usize = DEFAULT_MAX_CONCURRENT_CONNECTIONS;
     let mut host_share_stdin = false;
 
     while let Some(flag_os) = iter.next() {
@@ -86,6 +95,12 @@ where
                     reason: "missing path after --ring0-socket",
                 })?;
                 ring0_socket = Some(PathBuf::from(path));
+            }
+            "--policy-file" => {
+                let path = iter.next().ok_or(DaemonError::InvalidCliUsage {
+                    reason: "missing path after --policy-file",
+                })?;
+                policy_file = Some(PathBuf::from(path));
             }
             "--ring0-uid" => {
                 let val_os = iter.next().ok_or(DaemonError::InvalidCliUsage {
@@ -121,12 +136,59 @@ where
                 let val_s = val_os.to_str().ok_or(DaemonError::InvalidCliUsage {
                     reason: "invalid --guest-cid encoding",
                 })?;
-                mapped_guest_cid =
+                let parsed_cid =
                     val_s
                         .parse::<u32>()
                         .map_err(|_| DaemonError::InvalidCliUsage {
                             reason: "invalid integer for --guest-cid",
                         })?;
+                if !(anvil_ipc::transport::MIN_GUEST_VSOCK_CID
+                    ..=anvil_ipc::transport::MAX_GUEST_VSOCK_CID)
+                    .contains(&parsed_cid)
+                {
+                    return Err(DaemonError::InvalidCliUsage {
+                        reason: "--guest-cid is in reserved range (must be >= 3)",
+                    });
+                }
+                mapped_guest_cid = parsed_cid;
+            }
+            "--vsock-port" => {
+                let val_os = iter.next().ok_or(DaemonError::InvalidCliUsage {
+                    reason: "missing port after --vsock-port",
+                })?;
+                let val_s = val_os.to_str().ok_or(DaemonError::InvalidCliUsage {
+                    reason: "invalid --vsock-port encoding",
+                })?;
+                let port = val_s
+                    .parse::<u32>()
+                    .map_err(|_| DaemonError::InvalidCliUsage {
+                        reason: "invalid integer for --vsock-port",
+                    })?;
+                if port == 0 {
+                    return Err(DaemonError::InvalidCliUsage {
+                        reason: "--vsock-port must be non-zero",
+                    });
+                }
+                vsock_port = Some(port);
+            }
+            "--max-connections" => {
+                let val_os = iter.next().ok_or(DaemonError::InvalidCliUsage {
+                    reason: "missing integer after --max-connections",
+                })?;
+                let val_s = val_os.to_str().ok_or(DaemonError::InvalidCliUsage {
+                    reason: "invalid --max-connections encoding",
+                })?;
+                let count = val_s
+                    .parse::<usize>()
+                    .map_err(|_| DaemonError::InvalidCliUsage {
+                        reason: "invalid integer for --max-connections",
+                    })?;
+                if count == 0 || count > 4_096 {
+                    return Err(DaemonError::InvalidCliUsage {
+                        reason: "--max-connections must be between 1 and 4096",
+                    });
+                }
+                max_connections = count;
             }
             "--host-share-stdin" => {
                 host_share_stdin = true;
@@ -157,5 +219,8 @@ where
         ring0_uid,
         allowed_peer_uid,
         mapped_guest_cid,
+        policy_file,
+        vsock_port,
+        max_connections,
     })
 }

@@ -234,3 +234,113 @@ fn redteam_secret_redaction_guarantee_and_ledger_tamper_resistance() {
     second.prev_hash = GENESIS_PREV_HASH;
     assert!(AuditLedger::verify_slice(&GENESIS_PREV_HASH, &[first, second]).is_err());
 }
+
+#[test]
+fn redteam_future_pinned_front_nonce_double_spend_and_monotonic_clock() {
+    let filter = ReplayFilter::with_defaults(1_024).unwrap();
+    let nonce_future = [0xA1; 32];
+    let nonce_victim = [0xB2; 32];
+
+    // Step 1: Attacker pins order.front() with a +30s future-skewed timestamp at t = 100_000
+    filter
+        .check_and_burn(nonce_future, 130_000, 100_000)
+        .unwrap();
+
+    // Step 2: Victim burns nonce_victim with a -30s timestamp at t = 100_000
+    filter
+        .check_and_burn(nonce_victim, 70_000, 100_000)
+        .unwrap();
+
+    // Step 3: Even 45s later (t = 145_000), a nonce burned within the 60s window MUST remain burned
+    let nonce_mid = [0xC3; 32];
+    filter.check_and_burn(nonce_mid, 100_000, 100_000).unwrap();
+    assert_eq!(
+        filter
+            .check_and_burn(nonce_mid, 145_000, 145_000)
+            .unwrap_err(),
+        ReplayError::NonceAlreadyBurned,
+        "nonce must remain burned across the full 2 * skew_window_ms (60s) window"
+    );
+
+    // Step 4: Even after >60s allows re-burn at t = 165_000, expiring the old front entry MUST NOT
+    // delete the newly re-burned entry from the active map (future-pinned front double-spend race)
+    let filter2 = ReplayFilter::with_defaults(1_024).unwrap();
+    filter2
+        .check_and_burn(nonce_future, 130_000, 100_000)
+        .unwrap();
+    filter2
+        .check_and_burn(nonce_victim, 70_000, 100_000)
+        .unwrap();
+    // Advance past 60s from t=100_000 -> t=160_500; re-burn nonce_victim legitimately
+    let _ = filter2.check_and_burn(nonce_victim, 160_500, 160_500);
+    // Replay identical (nonce_victim, 160_500) 5s later at t = 165_500: MUST fail closed!
+    assert_eq!(
+        filter2
+            .check_and_burn(nonce_victim, 160_500, 165_500)
+            .unwrap_err(),
+        ReplayError::NonceAlreadyBurned,
+        "stale queue entry must never evict a freshly burned nonce (double-spend regression)"
+    );
+
+    // Step 5: NTP backward clock jump must never allow replaying an old timestamp/nonce
+    let filter_ntp = ReplayFilter::with_defaults(128).unwrap();
+    let nonce_ntp = [0xD4; 32];
+    filter_ntp
+        .check_and_burn(nonce_ntp, 200_000, 200_000)
+        .unwrap();
+    filter_ntp
+        .check_and_burn([0xD5; 32], 270_000, 270_000)
+        .unwrap();
+    // Simulate wall-clock rewound backward by 69.995 seconds to 200_005
+    assert!(
+        filter_ntp
+            .check_and_burn(nonce_ntp, 200_000, 200_005)
+            .is_err(),
+        "backward clock jump must clamp to monotonic high-water mark and reject old timestamps"
+    );
+}
+
+#[test]
+fn redteam_oversized_envelope_rejected_and_bounded_ledger_retention() {
+    use anvil_core::unwrap::{SealedSecretEnvelope, ENVELOPE_VERSION_V1};
+
+    // 1. Craft a wire envelope declaring 65_537 bytes (> 64 KiB hard cap)
+    let oversized_ct_len: u32 = 65_537;
+    let mut wire = Vec::with_capacity(49 + oversized_ct_len as usize);
+    wire.push(ENVELOPE_VERSION_V1);
+    wire.extend_from_slice(&[0x11; 32]);
+    wire.extend_from_slice(&[0x22; 12]);
+    wire.extend_from_slice(&oversized_ct_len.to_be_bytes());
+    wire.resize(49 + oversized_ct_len as usize, 0xAA);
+
+    assert_eq!(
+        SealedSecretEnvelope::from_bytes(&wire).unwrap_err(),
+        CryptoError::InvalidEnvelopeFormat,
+        "SealedSecretEnvelope::from_bytes must reject ciphertexts exceeding 64 KiB"
+    );
+
+    // 2. Append 5_000 events to AuditLedger and assert bounded RAM retention + intact chain verification
+    let ledger = AuditLedger::new();
+    for seq in 0..5_000u64 {
+        let e = ledger
+            .append(LedgerEventInput {
+                timestamp_ms: 1_000_000 + seq,
+                kind: "ipc.event",
+                actor: "cid:3",
+                summary: "bounded retention check",
+            })
+            .unwrap();
+        assert_eq!(e.sequence, seq);
+    }
+
+    let snapshot = ledger.entries_snapshot().unwrap();
+    assert!(
+        snapshot.len() <= 4_096,
+        "AuditLedger in-memory retention must be bounded (got {} entries)",
+        snapshot.len()
+    );
+    assert_eq!(snapshot.last().unwrap().sequence, 4_999);
+    ledger
+        .verify_all()
+        .expect("bounded AuditLedger must verify retained chain against anchor hash");
+}

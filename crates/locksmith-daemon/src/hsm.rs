@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-hsm"))]
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -79,8 +80,9 @@ pub(crate) fn exchange_ring0_challenge(
 }
 
 /// Serves `count` Ring 0 HMAC-SHA256 challenge-response requests over an unnamed
-/// kernel `UnixStream` socketpair (used by in-RAM startup KATs without touching disk).
-pub(crate) fn serve_ring0_hmac_stream(
+/// kernel `UnixStream` socketpair (strictly gated for unit/integration test suites).
+#[cfg(any(test, feature = "test-hsm"))]
+pub fn serve_ring0_hmac_stream(
     mut stream: UnixStream,
     ring0_secret: Zeroizing<[u8; 32]>,
     expected_client_uid: u32,
@@ -122,15 +124,18 @@ pub(crate) fn serve_ring0_hmac_stream(
     Ok(())
 }
 
-/// Connected in-RAM socketpair Ring 0 hardware unwrapper (used for `--read-only` startup KATs).
-pub(crate) struct ConnectedRing0StreamUnwrapper {
+/// Connected in-RAM socketpair Ring 0 hardware unwrapper (strictly gated for tests).
+#[cfg(any(test, feature = "test-hsm"))]
+pub struct ConnectedRing0StreamUnwrapper {
     stream: Mutex<UnixStream>,
     expected_peer_uid: u32,
     timeout: Duration,
 }
 
+#[cfg(any(test, feature = "test-hsm"))]
 impl ConnectedRing0StreamUnwrapper {
-    pub(crate) fn new(stream: UnixStream, expected_peer_uid: u32, timeout: Duration) -> Self {
+    #[must_use]
+    pub fn new(stream: UnixStream, expected_peer_uid: u32, timeout: Duration) -> Self {
         Self {
             stream: Mutex::new(stream),
             expected_peer_uid,
@@ -139,6 +144,7 @@ impl ConnectedRing0StreamUnwrapper {
     }
 }
 
+#[cfg(any(test, feature = "test-hsm"))]
 impl HardwareUnwrapper for ConnectedRing0StreamUnwrapper {
     fn derive_hardware_share(&self, challenge: &[u8]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
         let mut guard = self
@@ -186,12 +192,33 @@ impl Ring0UnixHardwareUnwrapper {
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
+
+    fn connect_and_exchange(&self, challenge: &[u8]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            let meta = std::fs::symlink_metadata(&self.socket_path)
+                .map_err(|_| CryptoError::HardwareFailure)?;
+            if !meta.file_type().is_socket() {
+                return Err(CryptoError::HardwareFailure);
+            }
+        }
+        let mut stream =
+            UnixStream::connect(&self.socket_path).map_err(|_| CryptoError::HardwareFailure)?;
+        exchange_ring0_challenge(&mut stream, self.expected_peer_uid, self.timeout, challenge)
+    }
 }
 
 impl HardwareUnwrapper for Ring0UnixHardwareUnwrapper {
     fn derive_hardware_share(&self, challenge: &[u8]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
-        let mut stream =
-            UnixStream::connect(&self.socket_path).map_err(|_| CryptoError::HardwareFailure)?;
-        exchange_ring0_challenge(&mut stream, self.expected_peer_uid, self.timeout, challenge)
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                return tokio::task::block_in_place(|| self.connect_and_exchange(challenge));
+            }
+        }
+        self.connect_and_exchange(challenge)
     }
 }

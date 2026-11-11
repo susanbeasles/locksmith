@@ -100,7 +100,7 @@ SealedSecretEnvelope {
     version: u8,              // Must equal 1
     hkdf_salt: [u8; 32],      // Per-envelope random HKDF salt
     nonce: [u8; 12],          // 96-bit ChaCha20-Poly1305 unique nonce
-    ciphertext_and_tag: Vec<u8>, // Ciphertext || 16-byte Poly1305 authentication tag
+    ciphertext_and_tag: Vec<u8>, // Ciphertext || 16-byte Poly1305 tag (<= 64 KiB)
 }
 ```
 
@@ -122,25 +122,28 @@ Encoded using the exact length-prefixed format:
 6. Open `ciphertext_and_tag` using `aws_lc_rs::aead::LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &*kek)?)` with `Nonce::try_assume_unique_for_key(&envelope.nonce)` and `Aad::from(&aad_bytes)`.
 7. On any tag, ciphertext, nonce, share, or AAD mismatch, zeroize intermediate buffers and return `Err(CryptoError::AuthenticationFailed)` with zero partial plaintext returned.
 8. Wrap plaintext in `SecretBytes(Zeroizing<Vec<u8>>)`, whose `fmt::Debug` and `fmt::Display` unconditionally emit `"SecretBytes([REDACTED])"`.
+9. Production compilation enforces `#[cfg(all(feature = "prod-strict", feature = "test-hsm"))] compile_error!(...)` so `SoftwareTestHsm` can never be linked into production binaries.
 
 ### 2.4 Concurrency-Safe Single-Use Nonce Filter (`anvil_core::replay`)
 
-- Each privileged operation supplies `(nonce: [u8; 32], timestamp_ms: u64)`.
-- **Freshness Check:** Given `now_ms`, reject `timestamp_ms` with `ReplayError::TimestampExpired` if `now_ms.saturating_sub(timestamp_ms) > skew_window_ms` or `ReplayError::TimestampInFuture` if `timestamp_ms.saturating_sub(now_ms) > skew_window_ms` (default `skew_window_ms = 30_000` ms = `+-30s`).
-- **Atomic Burn & Eviction-Replay Immunity:**
-  1. Acquire internal mutex lock over `(HashMap<[u8; 32], u64>, VecDeque<([u8; 32], u64)>)`.
-  2. Purge all entries whose expiry (`recorded_timestamp_ms + skew_window_ms`) is strictly older than `now_ms.saturating_sub(skew_window_ms)`.
-  3. If `nonce` is already present in the live map, immediately return `Err(ReplayError::NonceAlreadyBurned)`.
-  4. If live map length equals `max_entries`, fail closed with `Err(ReplayError::CapacityExceeded)`—**never** evict an unexpired nonce (preventing cache-thrash replay attacks).
-  5. Insert `(nonce, timestamp_ms)` and return `Ok(())`.
+- Each privileged operation supplies `(nonce: [u8; 32], timestamp_ms: u64)` evaluated against a monotonically non-decreasing clock (`ReplayFilter::monotonic_now_ms()` anchored to `std::time::Instant` so NTP backward steps cannot replay nonces).
+- **Freshness Check:** Given monotonic `effective_now_ms`, reject `timestamp_ms` with `ReplayError::TimestampExpired` if `effective_now_ms.saturating_sub(timestamp_ms) > skew_window_ms` or `ReplayError::TimestampInFuture` if `timestamp_ms.saturating_sub(effective_now_ms) > skew_window_ms` (default `skew_window_ms = 30_000` ms = `+-30s`).
+- **Atomic Burn & Future-Pinned Eviction Immunity:**
+  1. Acquire internal mutex lock over `(HashMap<[u8; 32], u64>, VecDeque<([u8; 32], u64)>, last_now_ms)`.
+  2. Clamp `effective_now_ms = now_ms.max(last_now_ms)`.
+  3. Purge front queue entries whose monotonic expiry (`front_expires_at = recorded_now_ms + 2 * skew_window_ms`, i.e., full `60s` validity span) satisfies `front_expires_at <= effective_now_ms`, removing `front_nonce` from `burned` **only** when `burned.get(&front_nonce) == Some(&front_expires_at)`.
+  4. If `nonce` is already present in the live map, immediately return `Err(ReplayError::NonceAlreadyBurned)`.
+  5. If either `burned.len() >= max_entries` or `order.len() >= max_entries`, fail closed with `Err(ReplayError::CapacityExceeded)`—**never** evict an unexpired nonce.
+  6. Insert `expires_at_ms = effective_now_ms + 2 * skew_window_ms` into both `burned` and `order` and return `Ok(())`.
 
 ### 2.5 Append-Only `BLAKE3` Audit Ledger (`anvil_core::ledger`)
 
 - Genesis anchor: `GENESIS_PREV_HASH = [0u8; 32]`.
 - Each `LedgerEvent` (`sequence: u64`, `timestamp_ms: u64`, `kind: String`, `actor: String`, `summary: String`) serializes deterministically into `canonical_event_bytes`:
   `[b"LOCKSMITH-LEDGER-V1" || sequence_be: 8B || timestamp_ms_be: 8B || u16_be(kind.len()) || kind || u16_be(actor.len()) || actor || u16_be(summary.len()) || summary]`.
-- Chaining equation:
+- Chaining equation (streamed directly into `blake3::Hasher` without intermediate buffer concatenation):
   `entry_hash = blake3::hash(prev_hash || canonical_event_bytes)`.
+- Retains a bounded in-memory sliding window (`VecDeque<LedgerEntry>`, default `4,096` entries) anchored to `retained_anchor_prev_hash` while maintaining monotonic `total_committed` sequence continuity so unauthenticated event floods cannot exhaust Ring 1 RAM.
 - `AuditLedger::verify_slice(expected_prev_hash: &[u8; 32], entries: &[LedgerEntry])` verifies contiguous sequence progression, `prev_hash` linkage, and constant-time equality of recomputed `entry_hash` across any contiguous slice of entries.
 
 ---
@@ -151,7 +154,7 @@ Ring 1 treats disk-backed cache directories as **untrusted, potentially hostile 
 
 ### 3.1 Content Addressing & Keyed `BLAKE3` Binding (`store.rs`)
 
-- Every cache blob is addressed on disk by its hex-encoded `BLAKE3` content root (`<64-hex>.blob`), paired with a compact binary header/manifest `<64-hex-key-id>.entry`.
+- Every cache blob is addressed on disk by its hex-encoded `BLAKE3` content root (`<64-hex>.blob`), paired with a compact binary header/manifest `<64-hex-key-id>.entry`, read and written exclusively via confined `openat2` (`BENEATH | NO_SYMLINKS | NO_XDEV`) + atomic `0600` temp-file `fsync` + `renameat` relative to an `O_NOFOLLOW | O_DIRECTORY` root `OwnedFd`.
 - Before any cache hit is returned, `CacheStore` computes a keyed `BLAKE3` MAC (`blake3::keyed_hash(&mac_key, &canonical_record)`) over:
   1. Domain prefix `b"LOCKSMITH-CACHE-MAC-V1"`
   2. `u16_be(logical_cache_key.len()) || logical_cache_key.as_bytes()`
@@ -183,7 +186,7 @@ stateDiagram-v2
    - Streams at most `max_blob_bytes` from the untrusted disk fd into the `memfd`, computing `blake3::Hasher` in-flight. Disk fd is closed immediately.
    - Applies kernel seals `SealFlags::WRITE | SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL` via `rustix::fs::fcntl_add_seals` and verifies via `fcntl_get_seals` **before** verifying final metadata/MAC and constructing `VerifiedReadOnlyBlob`.
    - Once sealed, mutating or truncating the original disk file cannot alter the `memfd`, and any attempt by any process with the `memfd` descriptor to `write()` or `ftruncate()` fails in the kernel with `EPERM`.
-   - If the host kernel blocks `memfd_create` (`ENOSYS` / `EPERM` under restrictive seccomp) or on non-Linux targets, falls back to a private, verified `Arc<[u8]>` copied entirely into process RAM prior to verification.
+   - On Linux, `SealPolicy::RequireKernelMemfd` (default) **fails closed** (`CacheError::SealFailure`) if `memfd_create` or kernel sealing fails unless an explicit test-only `SealPolicy::AllowUnsealedFallback` policy is passed. Non-Linux development targets use a private verified `Arc<[u8]>` in process RAM.
 
 ### 3.3 Metadata & Prompt-Injection Sanitizer (`sanitize.rs`)
 
@@ -222,18 +225,18 @@ Every message on `AF_VSOCK` or `AF_UNIX` uses a fixed 10-byte big-endian header 
 ### 4.2 Kernel-Verified Peer Transport (`transport.rs`)
 
 Connections are authenticated at `accept()` time **before** reading a single wire byte:
-1. **Linux `AF_VSOCK` (`#[cfg(target_os = "linux")]`):** Wraps `tokio_vsock::VsockListener`; extracts peer `VsockAddr::cid()` and checks `allowlist.contains_cid(peer_cid)`. Unauthorized CIDs are closed immediately (`IpcError::UnauthorizedPeer`).
-2. **Unix Domain Socket (`AF_UNIX`):** Wraps `tokio::net::UnixListener`; on Linux extracts kernel `ucred` (`uid`, `gid`, `pid`) via `rustix::net::sockopt::socket_peercred` and checks `allowlist.contains_uid(peer_uid)`. Unauthorized UIDs are closed immediately (`IpcError::UnauthorizedPeer`).
+1. **Linux `AF_VSOCK` (`#[cfg(target_os = "linux")]`):** Wraps `tokio_vsock::VsockListener`; extracts peer `VsockAddr::cid()`, rejects reserved hypervisor/loopback/host/wildcard CIDs (`0..=2` and `VMADDR_CID_ANY` `u32::MAX`), and checks `allowlist.contains_cid(peer_cid)`. Unauthorized CIDs are closed immediately (`IpcError::UnauthorizedPeer`).
+2. **Unix Domain Socket (`AF_UNIX`):** `UnixIpcListener::bind` creates and verifies an owner-only `0600` socket file (`is_socket() && mode == 0600`) prior to accepting connections; on Linux extracts kernel `ucred` (`uid`, `gid`, `pid`) via `rustix::net::sockopt::socket_peercred` and checks `allowlist.contains_uid(peer_uid)` mapped strictly to valid guest CIDs (`3..=u32::MAX - 1`). Unauthorized UIDs are closed immediately (`IpcError::UnauthorizedPeer`).
 
 ### 4.3 Attested Command Envelope (`envelope.rs`)
 
 Privileged control-plane frames carry `AttestedCommandEnvelope`:
-- `guest_cid: u32` (must equal transport-authenticated peer CID when over `AF_VSOCK`)
-- `sequence_no: u64`
+- `guest_cid: u32` (must equal transport-authenticated peer CID in `3..=u32::MAX - 1`)
+- `sequence_no: u64` (strictly monotonic; `u64::MAX` fails closed with `IpcError::SequenceExhausted` to prevent watermark wraparound)
 - `timestamp_ms: u64`
 - `nonce: [u8; 32]`
 - `command_digest: [u8; 32]` (`BLAKE3` digest of `command_payload`)
-- `hardware_signature: [u8; 32]` (HMAC/keyed-BLAKE3 tag under `ipc-attest-v1` subkey over canonical envelope fields)
+- `hardware_signature: [u8; 32]` (keyed-`BLAKE3` tag under `ipc-attest-v1` subkey over canonical envelope fields)
 
 Verified in constant time and burned in `ReplayFilter` prior to invoking any command handler.
 
@@ -250,8 +253,8 @@ pub struct ApprovedEgressTicket {
     verified_port: u16,
     canonical_request_head: Vec<u8>,
     request_body: Vec<u8>,
-    auth_header_name: String,
-    auth_header_value: Zeroizing<String>,
+    injection_header_name: String,
+    injection_header_value: Zeroizing<String>,
     raw_secret: SecretBytes,
 }
 ```
@@ -264,29 +267,29 @@ pub struct ApprovedEgressTicket {
 
 `PolicyEngine::authorize_egress()` executes five sequential fail-closed checks:
 
-1. **RFC 8705 mTLS Certificate Thumbprint Binding:**
-   - Computes `SHA256(peer_leaf_cert_der)` and verifies constant-time equality against the registered `WorkloadIdentity::cert_thumbprint_sha256` for the claimed workload. Mismatches fail with `PolicyError::CertificateThumbprintMismatch`.
-2. **Static Upstream Tuple Allowlist:**
-   - Matches `(sni_hostname, port, http_method, normalized_path)` against workload-scoped `EgressRule`s.
-   - Rejects paths containing `..` segments, percent-encoded dot segments (`%2e` / `%2E`), backslashes, NULs, or non-origin-form request targets (`PolicyError::DisallowedTarget` / `PolicyError::MalformedHttpRequest`).
+1. **RFC 8705 mTLS Certificate Thumbprint & Transport CID Binding:**
+   - Enforces `proxy_req.guest_cid == authenticated_guest_cid`, computes `SHA256(peer_leaf_cert_der)`, and verifies constant-time equality against the registered `WorkloadIdentity::cert_thumbprint_sha256` for the claimed workload.
+2. **Static Upstream Tuple Allowlist & Segment-Boundary Matching:**
+   - Matches `(sni_hostname, port, http_method, path_and_query)` against workload-scoped `EgressRule`s using segment-boundary prefix checks (`/v1/messages` matches `/v1/messages` and `/v1/messages/...`, never `/v1/messages_admin`).
+   - Iteratively percent-decodes (up to 8 passes) to reject hidden `.`/`..` dot segments, double slashes (`//`), path parameters (`;`), fragments (`#`), malformed `%` escapes, backslashes, NULs, or non-origin-form request targets.
 3. **Strict RFC 9110 / RFC 9112 HTTP/1.1 Request Canonicalization:**
    - Requires exact `HTTP/1.1` request line without CR/LF/NUL injection.
-   - Validates every header name is non-empty RFC 9110 `tchar` (`!#$%&'*+-.^_`|~0-9A-Za-z`) and every header value contains **zero** `\r`, `\n`, `\0`, or C0 control bytes (except HTAB `0x09`).
+   - Validates every header name is non-empty RFC 9110 `tchar` and every header value contains **zero** `\r`, `\n`, `\0`, or C0 control bytes (except HTAB `0x09`).
    - Enforces **strictly one `Host` header** whose hostname matches `sni_hostname` byte-for-byte (case-insensitive ASCII normalized to lowercase; optional `:port` permitted only if matching `verified_port`). Missing, duplicate, or mismatched `Host` headers fail with `PolicyError::HostSniMismatch` **before any upstream socket is dialed**.
-   - Rejects requests carrying `Transfer-Encoding` alongside `Content-Length`, any unsupported `Transfer-Encoding`, duplicate `Content-Length` headers, or body length != `Content-Length` (`PolicyError::SmugglingDetected`).
-   - Strips or rejects any guest-supplied `Authorization` or `Proxy-Authorization` headers per rule configuration (`GuestAuthMode::Reject` / `GuestAuthMode::Strip`), preventing credential confusion, and forces `Connection: close` for deterministic single-request framing.
+   - Rejects requests carrying `Transfer-Encoding` alongside `Content-Length`, any unsupported `Transfer-Encoding`, duplicate `Content-Length` headers, or body length != `Content-Length`.
+   - Strips or rejects guest-supplied `Authorization`/`Proxy-Authorization` headers per `guest_auth_mode` (bound into `EgressRule::policy_hash` with `u64` length prefixes), strips guest `Accept-Encoding`/`TE`/`Range`, injects `Accept-Encoding: identity`, and forces `Connection: close`.
 4. **Atomic Nonce Burn:**
    - Burns `(request_nonce, timestamp_ms)` in `anvil_core::replay::ReplayFilter`.
-5. **2-of-2 Hardware-Attested Credential Unwrap:**
-   - Unwraps `SecretBytes` via `anvil_core::unwrap::SecretUnwrapper` with `UnwrapAad { secret_id, policy_hash, guest_cid }` and formats the outbound header inside `Zeroizing<String>`.
+5. **2-of-2 Hardware-Attested Credential Unwrap & Entropy Floor:**
+   - Unwraps `SecretBytes` via `anvil_core::unwrap::SecretUnwrapper` with `UnwrapAad { secret_id, policy_hash, guest_cid }`, enforces a minimum 8-byte secret length (`PolicyError::SecretTooShort`), and formats the outbound header inside `Zeroizing<String>`.
 
-### 5.3 TLS 1.3 Splicing & Upstream Secret Reflection Scrubber (`splicer.rs`)
+### 5.3 TLS 1.3 Splicing, SSRF Guard & Reflection Scrubber (`splicer.rs`)
 
-1. Constructs `rustls::pki_types::ServerName::try_from(ticket.verified_sni())`—guaranteeing the TLS SNI extension and X.509 server certificate verification are locked to the exact hostname validated against `Host`.
-2. Negotiates outbound TLS (`rustls` configured with `aws_lc_rs` crypto provider) and writes the canonical request head + injected secret header + body directly into the encrypted TLS stream. Zeroizing secret header buffers are dropped immediately after `flush()`.
-3. Reads the bounded upstream HTTP response, parses status + headers + body, and passes both header values and body bytes through `scrub_secret_reflections()`:
-   - Replaces every raw byte occurrence, URL-encoded form, and standard/URL-safe Base64 encoding of `raw_secret` with `b"[REDACTED_BY_LOCKSMITH]"`.
-   - Recomputes `Content-Length` (and strips `Transfer-Encoding: chunked` by re-framing as exact `Content-Length`) so Ring 2 receives a well-formed, completely redacted HTTP/1.1 response.
+1. Resolves `(verified_sni, verified_port)` via `UpstreamResolver`, rejecting loopback, RFC 1918 private, link-local/metadata (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`), multicast, unspecified, and IPv4-mapped non-global IPv6 addresses (`SystemDnsResolver`), and constructs `rustls::pki_types::ServerName::try_from(ticket.verified_sni())`.
+2. Negotiates outbound TLS 1.3 (`rustls` with `tls12` disabled at compile time and `aws_lc_rs` crypto provider) and writes the canonical request head + injected secret header + body directly into the encrypted TLS stream. Zeroizing secret header buffers are dropped immediately after `flush()`.
+3. Reads at most `MAX_UPSTREAM_RESPONSE_BYTES` (`16 MiB`), rejects non-`identity` `Content-Encoding`, and passes status reason, header values, and body bytes through a single-pass `scrub_secret_reflections()` scanner:
+   - Replaces every raw byte occurrence, uppercase/lowercase percent-encoded form, and `0`, `1`, and `2 mod 3` byte-offset standard/URL-safe Base64 encoding (including boundary nibbles and `=` padding) of `raw_secret` with `b"[REDACTED_BY_LOCKSMITH]"` without self-matching.
+   - Recomputes `Content-Length` (re-framing `Transfer-Encoding: chunked` into exact `Content-Length`) so Ring 2 receives a well-formed, completely redacted HTTP/1.1 response.
 
 ---
 

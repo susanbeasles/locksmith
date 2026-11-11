@@ -21,8 +21,21 @@ pub struct ApprovedEgressTicket {
     raw_secret: SecretBytes,
 }
 
+pub(crate) struct TicketMintParams {
+    pub workload_id: String,
+    pub guest_cid: u32,
+    pub verified_sni: String,
+    pub verified_port: u16,
+    pub canonical_request_prefix: Vec<u8>,
+    pub request_body: Vec<u8>,
+    pub injection_header_name: String,
+    pub injection_header_value: Zeroizing<String>,
+    pub raw_secret: SecretBytes,
+}
+
 pub(crate) struct ConsumedTicketParts {
     pub verified_sni: String,
+    pub verified_port: u16,
     pub canonical_request_prefix: Vec<u8>,
     pub request_body: Vec<u8>,
     pub injection_header_name: String,
@@ -31,28 +44,17 @@ pub(crate) struct ConsumedTicketParts {
 }
 
 impl ApprovedEgressTicket {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn mint(
-        workload_id: String,
-        guest_cid: u32,
-        verified_sni: String,
-        verified_port: u16,
-        canonical_request_prefix: Vec<u8>,
-        request_body: Vec<u8>,
-        injection_header_name: String,
-        injection_header_value: Zeroizing<String>,
-        raw_secret: SecretBytes,
-    ) -> Self {
+    pub(crate) fn mint(params: TicketMintParams) -> Self {
         Self {
-            workload_id,
-            guest_cid,
-            verified_sni,
-            verified_port,
-            canonical_request_prefix,
-            request_body,
-            injection_header_name,
-            injection_header_value,
-            raw_secret,
+            workload_id: params.workload_id,
+            guest_cid: params.guest_cid,
+            verified_sni: params.verified_sni,
+            verified_port: params.verified_port,
+            canonical_request_prefix: params.canonical_request_prefix,
+            request_body: params.request_body,
+            injection_header_name: params.injection_header_name,
+            injection_header_value: params.injection_header_value,
+            raw_secret: params.raw_secret,
         }
     }
 
@@ -83,6 +85,7 @@ impl ApprovedEgressTicket {
     pub(crate) fn consume(self) -> ConsumedTicketParts {
         ConsumedTicketParts {
             verified_sni: self.verified_sni,
+            verified_port: self.verified_port,
             canonical_request_prefix: self.canonical_request_prefix,
             request_body: self.request_body,
             injection_header_name: self.injection_header_name,

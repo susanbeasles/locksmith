@@ -30,6 +30,8 @@ pub enum IpcError {
     SignatureVerificationFailed,
     /// Command `sequence_no` did not strictly advance past prior sequence.
     SequenceViolation { last_seen: Option<u64>, actual: u64 },
+    /// Command `sequence_no` reached `u64::MAX` and cannot advance without wraparound.
+    SequenceExhausted { guest_cid: u32 },
     /// Nonce freshness or single-use burn check failed.
     Replay(ReplayError),
     /// Underlying socket/transport error.
@@ -70,6 +72,10 @@ impl fmt::Display for IpcError {
             Self::SequenceViolation { last_seen, actual } => write!(
                 f,
                 "non-monotonic command sequence {actual} (last_seen: {last_seen:?})"
+            ),
+            Self::SequenceExhausted { guest_cid } => write!(
+                f,
+                "command sequence space exhausted (u64::MAX) for guest CID {guest_cid}"
             ),
             Self::Replay(err) => write!(f, "command replay rejected: {err}"),
             Self::IoError(msg) => write!(f, "IPC transport I/O error: {msg}"),

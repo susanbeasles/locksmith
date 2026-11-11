@@ -54,7 +54,7 @@ async fn try_main() -> Result<(), DaemonError> {
         }
         CliCommand::Help => {
             println!(
-                "Usage: locksmith-daemon <verify-self | serve --ipc-socket <PATH> --ring0-socket <PATH> --host-share-stdin [--ring0-uid <UID>] [--allow-peer-uid <UID>] [--guest-cid <CID>] | --version | --help>"
+                "Usage: locksmith-daemon <verify-self | serve --ipc-socket <PATH> --ring0-socket <PATH> --host-share-stdin [--policy-file <PATH>] [--ring0-uid <UID>] [--allow-peer-uid <UID>] [--guest-cid <CID>] [--vsock-port <PORT>] [--max-connections <N>] | --version | --help>"
             );
             Ok(())
         }
@@ -64,7 +64,15 @@ async fn try_main() -> Result<(), DaemonError> {
             ring0_uid,
             allowed_peer_uid,
             mapped_guest_cid,
+            policy_file,
+            vsock_port,
+            max_connections,
         } => {
+            let loaded_policy = match policy_file {
+                Some(ref p) => Some(locksmith_daemon::load_policy_file(p)?),
+                None => None,
+            };
+
             let (host_share, attest_key) = read_host_share_from_stdin().await?;
             let ring0 =
                 Ring0UnixHardwareUnwrapper::new(ring0_socket, ring0_uid, Duration::from_secs(3));
@@ -72,22 +80,52 @@ async fn try_main() -> Result<(), DaemonError> {
             let replay = Arc::new(ReplayFilter::with_defaults(4_096)?);
             let ledger = Arc::new(AuditLedger::new());
             let verifier = Arc::new(CommandVerifier::new(*attest_key, Arc::clone(&replay)));
-            let policy_engine = Arc::new(PolicyEngine::new(Vec::new(), replay, unwrapper));
 
             let mut allowlist = PeerAllowlist::new();
             allowlist.allow_unix_uid(allowed_peer_uid, mapped_guest_cid);
 
-            let daemon = BrokerDaemon::new(
-                DaemonRuntimeConfig {
-                    ipc_socket_path: ipc_socket,
-                    frame_read_deadline: Duration::from_secs(5),
-                    shutdown_drain_timeout: Duration::from_secs(5),
-                    peer_allowlist: allowlist,
-                },
-                ledger,
-                verifier,
-                policy_engine,
-            );
+            let (workloads, mtls_pki) = match loaded_policy {
+                Some(bundle) => {
+                    for cid in bundle.vsock_cids {
+                        allowlist.allow_vsock_cid(cid);
+                    }
+                    for (uid, cid) in bundle.unix_uid_mappings {
+                        allowlist.allow_unix_uid(uid, cid);
+                    }
+                    (bundle.workloads, bundle.mtls_pki)
+                }
+                None => (Vec::new(), None),
+            };
+
+            let policy_engine = Arc::new(PolicyEngine::new(workloads, replay, unwrapper));
+            let runtime_cfg = DaemonRuntimeConfig {
+                ipc_socket_path: ipc_socket,
+                frame_read_deadline: Duration::from_secs(5),
+                shutdown_drain_timeout: Duration::from_secs(5),
+                peer_allowlist: allowlist,
+                max_concurrent_connections: max_connections,
+                vsock_listen_port: vsock_port,
+            };
+
+            let daemon = match mtls_pki {
+                Some(pki) => {
+                    let session = Arc::new(locksmith_proxy::MtlsProxySession {
+                        tls_server_config: pki.tls_server_config,
+                        policy_engine: Arc::clone(&policy_engine),
+                        upstream_resolver: Arc::new(locksmith_proxy::SystemDnsResolver),
+                        upstream_tls_config: pki.upstream_tls_config,
+                        io_timeout: Duration::from_secs(10),
+                    });
+                    BrokerDaemon::with_mtls_session(
+                        runtime_cfg,
+                        ledger,
+                        verifier,
+                        policy_engine,
+                        session,
+                    )
+                }
+                None => BrokerDaemon::new(runtime_cfg, ledger, verifier, policy_engine),
+            };
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             tokio::spawn(async move {

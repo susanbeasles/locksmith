@@ -1,17 +1,20 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anvil_core::unwrap::HardwareUnwrapper;
 use rustls::pki_types::ServerName;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroizing;
 
 use crate::error::{PolicyError, ProxyError};
 use crate::policy::{
-    EgressAuthorizationInput, OutboundHttpRequest, PolicyEngine, MAX_HTTP_WIRE_BYTES,
+    is_tchar, EgressAuthorizationInput, OutboundHttpRequest, PolicyEngine, MAX_HTTP_WIRE_BYTES,
 };
 use crate::ticket::ApprovedEgressTicket;
 
@@ -221,35 +224,129 @@ fn read_utf8_field(bytes: &[u8], cursor: &mut usize, len: usize) -> Result<Strin
     Ok(s.to_owned())
 }
 
-fn base64_encode_zeroized(input: &[u8], alphabet: &[u8; 64], pad: bool) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::with_capacity(input.len().div_ceil(3) * 4));
-    let mut chunks = input.chunks_exact(3);
-    for chunk in &mut chunks {
-        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
-        out.push(alphabet[((n >> 18) & 0x3F) as usize]);
-        out.push(alphabet[((n >> 12) & 0x3F) as usize]);
-        out.push(alphabet[((n >> 6) & 0x3F) as usize]);
-        out.push(alphabet[(n & 0x3F) as usize]);
+const fn b64_index(alphabet: &[u8; 64], byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        _ if byte == alphabet[62] => Some(62),
+        _ if byte == alphabet[63] => Some(63),
+        _ => None,
     }
-    let rem = chunks.remainder();
-    if rem.len() == 1 {
-        let n = u32::from(rem[0]) << 16;
-        out.push(alphabet[((n >> 18) & 0x3F) as usize]);
-        out.push(alphabet[((n >> 12) & 0x3F) as usize]);
-        if pad {
-            out.push(b'=');
-            out.push(b'=');
+}
+
+struct Base64WindowPattern {
+    alphabet: &'static [u8; 64],
+    prefix_mask_expected: Option<(u8, Zeroizing<u8>)>,
+    core: Zeroizing<Vec<u8>>,
+    suffix_mask_expected: Option<(u8, Zeroizing<u8>)>,
+    max_padding_eq: usize,
+}
+
+impl Base64WindowPattern {
+    fn build(secret: &[u8], alphabet: &'static [u8; 64], offset: u8) -> Option<Self> {
+        if secret.is_empty() {
+            return None;
         }
-    } else if rem.len() == 2 {
-        let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
-        out.push(alphabet[((n >> 18) & 0x3F) as usize]);
-        out.push(alphabet[((n >> 12) & 0x3F) as usize]);
-        out.push(alphabet[((n >> 6) & 0x3F) as usize]);
-        if pad {
-            out.push(b'=');
+        // Shifted 1-mod-3 and 2-mod-3 patterns share boundary nibbles with neighboring bytes;
+        // require >= 6 secret bytes (48+ bits) so invariant cores never false-match short ASCII words.
+        if offset != 0 && secret.len() < 6 {
+            return None;
         }
+
+        let mut core = Zeroizing::new(Vec::with_capacity(secret.len().div_ceil(3) * 4));
+        let (prefix_mask_expected, rest) = match offset {
+            0 => (None, secret),
+            1 => {
+                let s0 = secret[0];
+                let s1 = secret[1];
+                core.push(alphabet[(((s0 & 0x0F) << 2) | (s1 >> 6)) as usize]);
+                core.push(alphabet[(s1 & 0x3F) as usize]);
+                (Some((0x0F, Zeroizing::new((s0 >> 4) & 0x0F))), &secret[2..])
+            }
+            2 => {
+                let s0 = secret[0];
+                core.push(alphabet[(s0 & 0x3F) as usize]);
+                (Some((0x03, Zeroizing::new((s0 >> 6) & 0x03))), &secret[1..])
+            }
+            _ => return None,
+        };
+
+        let mut chunks = rest.chunks_exact(3);
+        for chunk in &mut chunks {
+            let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+            core.push(alphabet[((n >> 18) & 0x3F) as usize]);
+            core.push(alphabet[((n >> 12) & 0x3F) as usize]);
+            core.push(alphabet[((n >> 6) & 0x3F) as usize]);
+            core.push(alphabet[(n & 0x3F) as usize]);
+        }
+
+        let rem = chunks.remainder();
+        let (suffix_mask_expected, max_padding_eq) = match rem.len() {
+            0 => (None, 0),
+            1 => {
+                let r0 = rem[0];
+                core.push(alphabet[(r0 >> 2) as usize]);
+                (Some((0x30, Zeroizing::new((r0 & 0x03) << 4))), 2)
+            }
+            2 => {
+                let r0 = rem[0];
+                let r1 = rem[1];
+                core.push(alphabet[(r0 >> 2) as usize]);
+                core.push(alphabet[(((r0 & 0x03) << 4) | (r1 >> 4)) as usize]);
+                (Some((0x3C, Zeroizing::new((r1 & 0x0F) << 2))), 1)
+            }
+            _ => return None,
+        };
+
+        if core.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            alphabet,
+            prefix_mask_expected,
+            core,
+            suffix_mask_expected,
+            max_padding_eq,
+        })
     }
-    out
+
+    fn match_len_at(&self, input: &[u8], start: usize) -> Option<usize> {
+        let mut pos = start;
+
+        if let Some((mask, ref expected)) = self.prefix_mask_expected {
+            let b = *input.get(pos)?;
+            let idx = b64_index(self.alphabet, b)?;
+            if (idx & mask) != **expected {
+                return None;
+            }
+            pos += 1;
+        }
+
+        let core_end = pos.checked_add(self.core.len())?;
+        if input.get(pos..core_end)? != self.core.as_slice() {
+            return None;
+        }
+        pos = core_end;
+
+        if let Some((mask, ref expected)) = self.suffix_mask_expected {
+            let b = *input.get(pos)?;
+            let idx = b64_index(self.alphabet, b)?;
+            if (idx & mask) != **expected {
+                return None;
+            }
+            pos += 1;
+
+            if self.max_padding_eq == 2 && input.get(pos..pos + 2) == Some(b"==") {
+                pos += 2;
+            } else if self.max_padding_eq == 1 && input.get(pos) == Some(&b'=') {
+                pos += 1;
+            }
+        }
+
+        Some(pos - start)
+    }
 }
 
 const fn is_rfc3986_unreserved(b: u8) -> bool {
@@ -275,66 +372,68 @@ fn percent_encode_zeroized(input: &[u8], uppercase_hex: bool) -> Zeroizing<Vec<u
     out
 }
 
-fn replace_bytes_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return haystack.to_vec();
-    }
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut i = 0usize;
-    while i + needle.len() <= haystack.len() {
-        if &haystack[i..i + needle.len()] == needle {
-            out.extend_from_slice(replacement);
-            i += needle.len();
-        } else {
-            out.push(haystack[i]);
-            i += 1;
-        }
-    }
-    if i < haystack.len() {
-        out.extend_from_slice(&haystack[i..]);
-    }
-    out
-}
-
-/// Scrubs raw, URL-encoded, and Base64-encoded occurrences of `secret` from `input`,
-/// replacing every match with [`SCRUB_REPLACEMENT_TOKEN`].
+/// Scrubs raw, URL-encoded, and Base64-encoded (across `0`, `1`, and `2 mod 3`
+/// byte alignments in both standard and URL-safe alphabets) occurrences of `secret`
+/// from `input` in a **single left-to-right pass**, replacing every match with
+/// [`SCRUB_REPLACEMENT_TOKEN`] without ever re-scanning emitted replacement bytes.
 #[must_use]
 pub fn scrub_secret_reflections(input: &[u8], secret: &[u8]) -> Vec<u8> {
     if input.is_empty() || secret.is_empty() {
         return input.to_vec();
     }
 
-    let candidates = [
-        Zeroizing::new(secret.to_vec()),
-        percent_encode_zeroized(secret, true),
-        percent_encode_zeroized(secret, false),
-        base64_encode_zeroized(secret, BASE64_STD, true),
-        base64_encode_zeroized(secret, BASE64_STD, false),
-        base64_encode_zeroized(secret, BASE64_URL, true),
-        base64_encode_zeroized(secret, BASE64_URL, false),
+    let raw_needle = Zeroizing::new(secret.to_vec());
+    let pct_upper = percent_encode_zeroized(secret, true);
+    let pct_lower = percent_encode_zeroized(secret, false);
+    let literals: [&[u8]; 3] = [
+        raw_needle.as_slice(),
+        pct_upper.as_slice(),
+        pct_lower.as_slice(),
     ];
 
-    // Sort indices by descending needle length so padded encodings match before unpadded prefixes
-    let mut order = [0usize, 1, 2, 3, 4, 5, 6];
-    order.sort_by(|&a, &b| candidates[b].len().cmp(&candidates[a].len()));
+    let b64_patterns: [Option<Base64WindowPattern>; 6] = [
+        Base64WindowPattern::build(secret, BASE64_STD, 0),
+        Base64WindowPattern::build(secret, BASE64_URL, 0),
+        Base64WindowPattern::build(secret, BASE64_STD, 1),
+        Base64WindowPattern::build(secret, BASE64_URL, 1),
+        Base64WindowPattern::build(secret, BASE64_STD, 2),
+        Base64WindowPattern::build(secret, BASE64_URL, 2),
+    ];
 
-    let mut current = input.to_vec();
-    for idx in order {
-        let needle = candidates[idx].as_slice();
-        if needle.is_empty() {
-            continue;
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < input.len() {
+        let cur_byte = input[i];
+        let mut best_len = 0usize;
+
+        for lit in literals {
+            if !lit.is_empty()
+                && lit[0] == cur_byte
+                && lit.len() > best_len
+                && input.get(i..i + lit.len()) == Some(lit)
+            {
+                best_len = lit.len();
+            }
         }
-        // Skip duplicate needles already processed
-        let already_seen = order
-            .iter()
-            .take_while(|&&prev| prev != idx)
-            .any(|&prev| candidates[prev].as_slice() == needle);
-        if already_seen {
-            continue;
+
+        for pat in b64_patterns.iter().flatten() {
+            if let Some(matched_len) = pat.match_len_at(input, i) {
+                if matched_len > best_len {
+                    best_len = matched_len;
+                }
+            }
         }
-        current = replace_bytes_all(&current, needle, SCRUB_REPLACEMENT_TOKEN);
+
+        if best_len > 0 {
+            out.extend_from_slice(SCRUB_REPLACEMENT_TOKEN);
+            i += best_len;
+        } else {
+            out.push(cur_byte);
+            i += 1;
+        }
     }
-    current
+
+    out
 }
 
 fn decode_chunked_body(raw_chunked: &[u8]) -> Result<Vec<u8>, ProxyError> {
@@ -378,6 +477,11 @@ fn decode_chunked_body(raw_chunked: &[u8]) -> Result<Vec<u8>, ProxyError> {
                 reason: "truncated chunk payload",
             },
         )?;
+        decoded
+            .try_reserve(chunk_size)
+            .map_err(|_| ProxyError::MalformedUpstreamResponse {
+                reason: "chunked body allocation failed",
+            })?;
         decoded.extend_from_slice(chunk_data);
         cursor += chunk_size;
 
@@ -461,15 +565,37 @@ fn parse_and_scrub_upstream_response(
                 reason: "malformed upstream response header line",
             })?;
         let trimmed_name = name.trim();
+        if trimmed_name.is_empty() || !trimmed_name.bytes().all(is_tchar) {
+            return Err(ProxyError::MalformedUpstreamResponse {
+                reason: "invalid upstream response header name",
+            });
+        }
         let trimmed_val = val.trim_matches(|c| c == ' ' || c == '\t');
 
+        if trimmed_name.eq_ignore_ascii_case("content-encoding") {
+            if !trimmed_val.is_empty() && !trimmed_val.eq_ignore_ascii_case("identity") {
+                return Err(ProxyError::MalformedUpstreamResponse {
+                    reason: "compressed upstream Content-Encoding rejected",
+                });
+            }
+            continue;
+        }
         if trimmed_name.eq_ignore_ascii_case("transfer-encoding") {
             if trimmed_val.to_ascii_lowercase().contains("chunked") {
                 is_chunked = true;
+            } else {
+                return Err(ProxyError::MalformedUpstreamResponse {
+                    reason: "unsupported upstream Transfer-Encoding",
+                });
             }
             continue;
         }
         if trimmed_name.eq_ignore_ascii_case("content-length") {
+            if upstream_content_length.is_some() {
+                return Err(ProxyError::MalformedUpstreamResponse {
+                    reason: "duplicate upstream Content-Length",
+                });
+            }
             let parsed_cl = trimmed_val.parse::<usize>().map_err(|_| {
                 ProxyError::MalformedUpstreamResponse {
                     reason: "invalid upstream Content-Length",
@@ -485,6 +611,12 @@ fn parse_and_scrub_upstream_response(
         let scrubbed_val_bytes = scrub_secret_reflections(trimmed_val.as_bytes(), secret);
         let clean_val = sanitize_header_line_text(&scrubbed_val_bytes);
         sanitized_headers.push((trimmed_name.to_owned(), clean_val));
+    }
+
+    if is_chunked && upstream_content_length.is_some() {
+        return Err(ProxyError::MalformedUpstreamResponse {
+            reason: "conflicting Transfer-Encoding and Content-Length in upstream response",
+        });
     }
 
     let raw_body_section = &raw_resp[header_end + 4..];
@@ -526,17 +658,159 @@ fn parse_and_scrub_upstream_response(
     })
 }
 
-/// Consumes `ticket` **by value** (compile-time single-use), dials `upstream_addr`
-/// over TLS with `ServerName` pinned to `ticket.verified_sni()`, injects the
-/// zeroizing secret header into the encrypted stream, and scrubs any upstream
+/// Resolves a policy-verified `(verified_sni, verified_port)` pair to concrete
+/// upstream socket addresses prior to dialing TLS 1.3.
+pub trait UpstreamResolver: Send + Sync {
+    /// Resolves `(verified_sni, verified_port)` to one or more target [`SocketAddr`]s.
+    fn resolve_upstream<'a>(
+        &'a self,
+        verified_sni: &'a str,
+        verified_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, ProxyError>> + Send + 'a>>;
+}
+
+const fn is_globally_routable_ipv4(v4: Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    let is_cgnat = octets[0] == 100 && (octets[1] & 0xC0) == 64;
+    let is_benchmark = octets[0] == 198 && (octets[1] == 18 || octets[1] == 19);
+    !v4.is_loopback()
+        && !v4.is_private()
+        && !v4.is_link_local()
+        && !v4.is_broadcast()
+        && !v4.is_documentation()
+        && !v4.is_unspecified()
+        && !v4.is_multicast()
+        && !is_cgnat
+        && !is_benchmark
+}
+
+fn is_globally_routable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_globally_routable_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return is_globally_routable_ipv4(mapped_v4);
+            }
+            let seg0 = v6.segments()[0];
+            let is_unique_local = (seg0 & 0xfe00) == 0xfc00;
+            let is_link_local = (seg0 & 0xffc0) == 0xfe80;
+            let is_doc = seg0 == 0x2001 && v6.segments()[1] == 0x0db8;
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && !is_unique_local
+                && !is_link_local
+                && !is_doc
+        }
+    }
+}
+
+/// Production DNS resolver enforcing exact `verified_port` binding and rejecting
+/// loopback, RFC 1918 private, link-local/IMDS (`169.254.0.0/16`), multicast, and
+/// unspecified IP addresses (defeating DNS-rebinding SSRF).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemDnsResolver;
+
+impl UpstreamResolver for SystemDnsResolver {
+    fn resolve_upstream<'a>(
+        &'a self,
+        verified_sni: &'a str,
+        verified_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, ProxyError>> + Send + 'a>> {
+        Box::pin(async move {
+            if verified_port == 0 {
+                return Err(ProxyError::Policy(PolicyError::TargetNotAllowed));
+            }
+            let resolved = tokio::net::lookup_host((verified_sni, verified_port))
+                .await
+                .map_err(|e| ProxyError::TransportError(e.to_string()))?;
+            let mut valid = Vec::new();
+            for addr in resolved {
+                if addr.port() != verified_port || !is_globally_routable_ip(addr.ip()) {
+                    return Err(ProxyError::Policy(PolicyError::TargetNotAllowed));
+                }
+                valid.push(addr);
+            }
+            if valid.is_empty() {
+                return Err(ProxyError::TransportError(
+                    "DNS lookup returned zero globally routable addresses".to_owned(),
+                ));
+            }
+            Ok(valid)
+        })
+    }
+}
+
+/// Pinned `(sni_hostname, verified_port) -> SocketAddr` resolver failing closed
+/// with [`PolicyError::TargetNotAllowed`] whenever `(verified_sni, verified_port)`
+/// is not explicitly registered.
+#[derive(Clone, Debug, Default)]
+pub struct StaticEndpointResolver {
+    endpoints: HashMap<(String, u16), SocketAddr>,
+}
+
+impl StaticEndpointResolver {
+    /// Creates an empty [`StaticEndpointResolver`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a [`StaticEndpointResolver`] with a single `(sni, verified_port) -> addr` mapping.
+    #[must_use]
+    pub fn single(sni_hostname: &str, verified_port: u16, addr: SocketAddr) -> Self {
+        let mut r = Self::new();
+        r.insert(sni_hostname, verified_port, addr);
+        r
+    }
+
+    /// Registers an explicit `(sni_hostname, verified_port) -> addr` pin.
+    pub fn insert(&mut self, sni_hostname: &str, verified_port: u16, addr: SocketAddr) {
+        self.endpoints
+            .insert((sni_hostname.to_ascii_lowercase(), verified_port), addr);
+    }
+}
+
+impl UpstreamResolver for StaticEndpointResolver {
+    fn resolve_upstream<'a>(
+        &'a self,
+        verified_sni: &'a str,
+        verified_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, ProxyError>> + Send + 'a>> {
+        Box::pin(async move {
+            let key = (verified_sni.to_ascii_lowercase(), verified_port);
+            let Some(&addr) = self.endpoints.get(&key) else {
+                return Err(ProxyError::Policy(PolicyError::TargetNotAllowed));
+            };
+            Ok(vec![addr])
+        })
+    }
+}
+
+/// Shared session configuration for terminating Ring 2 mTLS proxy streams without
+/// bloated argument lists.
+pub struct MtlsProxySession<H: HardwareUnwrapper, R: UpstreamResolver> {
+    pub tls_server_config: Arc<rustls::ServerConfig>,
+    pub policy_engine: Arc<PolicyEngine<H>>,
+    pub upstream_resolver: Arc<R>,
+    pub upstream_tls_config: Arc<rustls::ClientConfig>,
+    pub io_timeout: Duration,
+}
+
+/// Consumes `ticket` **by value** (compile-time single-use), resolves `(verified_sni, verified_port)`
+/// via `resolver`, dials TLS 1.3 with `ServerName` pinned to `ticket.verified_sni()`,
+/// injects the zeroizing secret header into the encrypted stream, and scrubs any upstream
 /// secret reflection before returning [`SanitizedHttpResponse`].
-pub async fn splice_outbound_request(
+pub async fn splice_outbound_request<R: UpstreamResolver + ?Sized>(
     ticket: ApprovedEgressTicket,
-    upstream_addr: SocketAddr,
+    resolver: &R,
     tls_client_config: Arc<rustls::ClientConfig>,
     io_timeout: Duration,
 ) -> Result<SanitizedHttpResponse, ProxyError> {
     let parts = ticket.consume();
+    if parts.verified_port == 0 {
+        return Err(ProxyError::Policy(PolicyError::TargetNotAllowed));
+    }
     let server_name = ServerName::try_from(parts.verified_sni.clone())
         .map_err(|_| ProxyError::InvalidServerName)?;
     if !matches!(server_name, ServerName::DnsName(_)) {
@@ -545,7 +819,14 @@ pub async fn splice_outbound_request(
 
     let ConsumedSpliceOutcome(raw_resp, raw_secret) =
         tokio::time::timeout(io_timeout, async move {
-            let tcp = TcpStream::connect(upstream_addr)
+            let addrs = resolver
+                .resolve_upstream(&parts.verified_sni, parts.verified_port)
+                .await?;
+            let target_addr = *addrs.first().ok_or_else(|| {
+                ProxyError::TransportError("no upstream address resolved".to_owned())
+            })?;
+
+            let tcp = TcpStream::connect(target_addr)
                 .await
                 .map_err(|e| ProxyError::TransportError(e.to_string()))?;
             let connector = TlsConnector::from(tls_client_config);
@@ -596,11 +877,16 @@ pub async fn splice_outbound_request(
     parse_and_scrub_upstream_response(&raw_resp, raw_secret.expose_secret())
 }
 
-async fn read_bounded_upstream_response<R: tokio::io::AsyncRead + Unpin>(
+async fn read_bounded_upstream_response<R: AsyncRead + Unpin>(
     reader: &mut R,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ProxyError> {
-    let mut resp_buf = Vec::with_capacity(4096);
+    let mut resp_buf = Vec::new();
+    resp_buf
+        .try_reserve(4096)
+        .map_err(|_| ProxyError::MalformedUpstreamResponse {
+            reason: "upstream response buffer allocation failed",
+        })?;
     let mut chunk = [0u8; 8192];
     loop {
         let n = reader
@@ -615,6 +901,11 @@ async fn read_bounded_upstream_response<R: tokio::io::AsyncRead + Unpin>(
                 reason: "upstream HTTP response exceeded size cap",
             });
         }
+        resp_buf
+            .try_reserve(n)
+            .map_err(|_| ProxyError::MalformedUpstreamResponse {
+                reason: "upstream response buffer growth failed",
+            })?;
         resp_buf.extend_from_slice(&chunk[..n]);
     }
     Ok(resp_buf)
@@ -622,21 +913,25 @@ async fn read_bounded_upstream_response<R: tokio::io::AsyncRead + Unpin>(
 
 struct ConsumedSpliceOutcome(Vec<u8>, anvil_core::unwrap::SecretBytes);
 
-/// Terminates one inbound Ring 2 mTLS connection, extracts the peer leaf X.509
-/// certificate DER, runs [`PolicyEngine::authorize_egress`] BEFORE dialing any
-/// upstream socket, and splices approved requests to `upstream_addr`.
-#[allow(clippy::too_many_arguments)]
-pub async fn handle_mtls_guest_connection<H: HardwareUnwrapper>(
-    guest_tcp: TcpStream,
-    tls_server_config: Arc<rustls::ServerConfig>,
-    policy_engine: &PolicyEngine<H>,
-    upstream_addr: SocketAddr,
-    upstream_tls_config: Arc<rustls::ClientConfig>,
+/// Terminates one inbound Ring 2 mTLS connection over any kernel-authenticated
+/// stream (`AF_VSOCK`, `AF_UNIX` `SO_PEERCRED`, or loopback test socket),
+/// enforces `proxy_req.guest_cid == authenticated_guest_cid`, runs
+/// [`PolicyEngine::authorize_egress`] on Tokio's blocking pool **before** dialing
+/// any upstream socket, and splices approved requests via `session.upstream_resolver`.
+pub async fn handle_mtls_guest_connection<S, H, R>(
+    guest_stream: S,
+    authenticated_guest_cid: u32,
+    session: &MtlsProxySession<H, R>,
     now_ms: u64,
-    io_timeout: Duration,
-) -> Result<SanitizedHttpResponse, ProxyError> {
-    let acceptor = TlsAcceptor::from(tls_server_config);
-    let mut guest_tls = tokio::time::timeout(io_timeout, acceptor.accept(guest_tcp))
+) -> Result<SanitizedHttpResponse, ProxyError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    H: HardwareUnwrapper + 'static,
+    R: UpstreamResolver,
+{
+    let io_timeout = session.io_timeout;
+    let acceptor = TlsAcceptor::from(Arc::clone(&session.tls_server_config));
+    let mut guest_tls = tokio::time::timeout(io_timeout, acceptor.accept(guest_stream))
         .await
         .map_err(|_| ProxyError::Timeout)?
         .map_err(|e| ProxyError::TransportError(e.to_string()))?;
@@ -663,13 +958,26 @@ pub async fn handle_mtls_guest_connection<H: HardwareUnwrapper>(
         ));
     }
 
-    let mut frame_buf = vec![0u8; frame_len];
+    let mut frame_buf = Vec::new();
+    frame_buf
+        .try_reserve_exact(frame_len)
+        .map_err(|e| ProxyError::TransportError(format!("mTLS frame allocation failed: {e}")))?;
+    frame_buf.resize(frame_len, 0u8);
+
     tokio::time::timeout(io_timeout, guest_tls.read_exact(&mut frame_buf))
         .await
         .map_err(|_| ProxyError::Timeout)?
         .map_err(|e| ProxyError::TransportError(e.to_string()))?;
 
     let proxy_req = MtlsProxyRequest::from_bytes(&frame_buf)?;
+    if proxy_req.guest_cid != authenticated_guest_cid {
+        let _ = guest_tls.shutdown().await;
+        return Err(ProxyError::Policy(PolicyError::GuestCidMismatch {
+            expected: authenticated_guest_cid,
+            actual: proxy_req.guest_cid,
+        }));
+    }
+
     let parsed_http = match OutboundHttpRequest::from_wire_bytes(&proxy_req.raw_http_request) {
         Ok(req) => req,
         Err(policy_err) => {
@@ -678,27 +986,43 @@ pub async fn handle_mtls_guest_connection<H: HardwareUnwrapper>(
         }
     };
 
-    let ticket = match policy_engine.authorize_egress(EgressAuthorizationInput {
-        workload_id: &proxy_req.workload_id,
-        guest_cid: proxy_req.guest_cid,
-        peer_cert_der: &peer_cert_der,
-        sni_hostname: &proxy_req.sni_hostname,
-        port: proxy_req.port,
-        nonce: proxy_req.nonce,
-        timestamp_ms: proxy_req.timestamp_ms,
-        now_ms,
-        request: parsed_http,
-    }) {
+    let policy_engine = Arc::clone(&session.policy_engine);
+    let auth_res = tokio::time::timeout(
+        io_timeout,
+        tokio::task::spawn_blocking(move || {
+            policy_engine.authorize_egress(EgressAuthorizationInput {
+                workload_id: &proxy_req.workload_id,
+                guest_cid: authenticated_guest_cid,
+                peer_cert_der: &peer_cert_der,
+                sni_hostname: &proxy_req.sni_hostname,
+                port: proxy_req.port,
+                nonce: proxy_req.nonce,
+                timestamp_ms: proxy_req.timestamp_ms,
+                now_ms,
+                request: parsed_http,
+            })
+        }),
+    )
+    .await
+    .map_err(|_| ProxyError::Timeout)?
+    .map_err(|e| ProxyError::TransportError(format!("policy task join failed: {e}")))?;
+
+    let ticket = match auth_res {
         Ok(t) => t,
         Err(policy_err) => {
-            // Close guest stream cleanly without ever dialing upstream_addr
+            // Close guest stream cleanly without ever resolving or dialing upstream
             let _ = guest_tls.shutdown().await;
             return Err(ProxyError::Policy(policy_err));
         }
     };
 
-    let sanitized =
-        splice_outbound_request(ticket, upstream_addr, upstream_tls_config, io_timeout).await?;
+    let sanitized = splice_outbound_request(
+        ticket,
+        session.upstream_resolver.as_ref(),
+        Arc::clone(&session.upstream_tls_config),
+        io_timeout,
+    )
+    .await?;
 
     tokio::time::timeout(io_timeout, async {
         guest_tls.write_all(&sanitized.raw_wire_bytes).await?;
@@ -716,11 +1040,42 @@ pub async fn handle_mtls_guest_connection<H: HardwareUnwrapper>(
 mod tests {
     use super::*;
 
+    fn test_base64_encode(input: &[u8], alphabet: &[u8; 64], pad: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
+        let mut chunks = input.chunks_exact(3);
+        for chunk in &mut chunks {
+            let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+            out.push(alphabet[((n >> 18) & 0x3F) as usize]);
+            out.push(alphabet[((n >> 12) & 0x3F) as usize]);
+            out.push(alphabet[((n >> 6) & 0x3F) as usize]);
+            out.push(alphabet[(n & 0x3F) as usize]);
+        }
+        let rem = chunks.remainder();
+        if rem.len() == 1 {
+            let n = u32::from(rem[0]) << 16;
+            out.push(alphabet[((n >> 18) & 0x3F) as usize]);
+            out.push(alphabet[((n >> 12) & 0x3F) as usize]);
+            if pad {
+                out.push(b'=');
+                out.push(b'=');
+            }
+        } else if rem.len() == 2 {
+            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
+            out.push(alphabet[((n >> 18) & 0x3F) as usize]);
+            out.push(alphabet[((n >> 12) & 0x3F) as usize]);
+            out.push(alphabet[((n >> 6) & 0x3F) as usize]);
+            if pad {
+                out.push(b'=');
+            }
+        }
+        out
+    }
+
     #[test]
     fn scrubber_redacts_raw_and_encoded_secret_occurrences() {
         let secret = b"sk-live+secret/999=";
         // Raw, percent-encoded, and Base64-encoded occurrences in one payload
-        let b64 = base64_encode_zeroized(secret, BASE64_STD, true);
+        let b64 = test_base64_encode(secret, BASE64_STD, true);
         let pct = percent_encode_zeroized(secret, true);
         let payload = format!(
             "upstream 502 debug: raw={} pct={} b64={}!",
@@ -748,5 +1103,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::MalformedUpstreamResponse { .. }));
+    }
+
+    #[test]
+    fn rejects_compressed_upstream_content_encoding_fail_closed() {
+        let compressed_resp =
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\n\r\n\x1f\x8b\x08\x00";
+        let err =
+            parse_and_scrub_upstream_response(compressed_resp, b"sk-live-secret-999").unwrap_err();
+        assert!(matches!(
+            err,
+            ProxyError::MalformedUpstreamResponse {
+                reason: "compressed upstream Content-Encoding rejected"
+            }
+        ));
     }
 }

@@ -21,10 +21,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use locksmith_proxy::splicer::handle_mtls_guest_connection;
 use locksmith_proxy::{
-    compute_cert_thumbprint_sha256, EgressAuthorizationInput, EgressRule, GuestAuthHeaderMode,
-    MtlsProxyRequest, OutboundHttpRequest, PolicyEngine, PolicyError, ProxyError, WorkloadIdentity,
+    compute_cert_thumbprint_sha256, handle_mtls_guest_connection, splice_outbound_request,
+    EgressAuthorizationInput, EgressRule, GuestAuthHeaderMode, MtlsProxyRequest, MtlsProxySession,
+    OutboundHttpRequest, PolicyEngine, PolicyError, ProxyError, StaticEndpointResolver,
+    WorkloadIdentity,
 };
 
 // ---------------------------------------------------------------------------
@@ -435,18 +436,21 @@ async fn redteam_domain_fronting_host_sni_desync_rejected_before_upstream_dial()
         tls.flush().await.unwrap();
     });
 
+    let session = MtlsProxySession {
+        tls_server_config: Arc::clone(&pki.proxy_server_cfg),
+        policy_engine: Arc::clone(&engine),
+        upstream_resolver: Arc::new(StaticEndpointResolver::single(
+            "api.anthropic.com",
+            443,
+            upstream_addr,
+        )),
+        upstream_tls_config: Arc::clone(&pki.proxy_to_upstream_client_cfg),
+        io_timeout: Duration::from_secs(2),
+    };
     let (accepted_tcp, _) = proxy_listener.accept().await.unwrap();
-    let err = handle_mtls_guest_connection(
-        accepted_tcp,
-        Arc::clone(&pki.proxy_server_cfg),
-        &engine,
-        upstream_addr,
-        Arc::clone(&pki.proxy_to_upstream_client_cfg),
-        now_ms,
-        Duration::from_secs(2),
-    )
-    .await
-    .unwrap_err();
+    let err = handle_mtls_guest_connection(accepted_tcp, 10, &session, now_ms)
+        .await
+        .unwrap_err();
     client_task.await.unwrap();
 
     assert!(matches!(
@@ -613,18 +617,21 @@ async fn redteam_stolen_request_wrong_mtls_thumbprint_rejected() {
         tls.flush().await.unwrap();
     });
 
+    let session = MtlsProxySession {
+        tls_server_config: Arc::clone(&pki.proxy_server_cfg),
+        policy_engine: Arc::clone(&engine),
+        upstream_resolver: Arc::new(StaticEndpointResolver::single(
+            "api.anthropic.com",
+            443,
+            upstream_addr,
+        )),
+        upstream_tls_config: Arc::clone(&pki.proxy_to_upstream_client_cfg),
+        io_timeout: Duration::from_secs(2),
+    };
     let (accepted_tcp, _) = proxy_listener.accept().await.unwrap();
-    let err = handle_mtls_guest_connection(
-        accepted_tcp,
-        Arc::clone(&pki.proxy_server_cfg),
-        &engine,
-        upstream_addr,
-        Arc::clone(&pki.proxy_to_upstream_client_cfg),
-        now_ms,
-        Duration::from_secs(2),
-    )
-    .await
-    .unwrap_err();
+    let err = handle_mtls_guest_connection(accepted_tcp, 10, &session, now_ms)
+        .await
+        .unwrap_err();
     rogue_guest.await.unwrap();
 
     assert!(matches!(
@@ -664,8 +671,11 @@ async fn redteam_live_mtls_splice_and_upstream_secret_reflection_scrubbing() {
             }
         }
         let req_text = String::from_utf8_lossy(&req_buf);
-        // Confirm real secret WAS injected into upstream TLS 1.3 stream and guest's dummy token stripped
+        // Confirm real secret WAS injected into upstream TLS 1.3 stream, guest's dummy token stripped,
+        // and guest's Accept-Encoding: gzip replaced with Accept-Encoding: identity!
         assert!(req_text.contains("Authorization: Bearer sk-live-secret-999\r\n"));
+        assert!(req_text.contains("Accept-Encoding: identity\r\n"));
+        assert!(!req_text.contains("Accept-Encoding: gzip"));
         assert!(!req_text.contains("guest-dummy-token"));
 
         // Hostile/buggy upstream echoes injected Authorization header inside BOTH X-Echo header and 502 body!
@@ -700,6 +710,7 @@ async fn redteam_live_mtls_splice_and_upstream_secret_reflection_scrubbing() {
                     "Authorization".to_owned(),
                     "Bearer guest-dummy-token".to_owned(),
                 ),
+                ("Accept-Encoding".to_owned(), "gzip, br".to_owned()),
                 ("Content-Type".to_owned(), "application/json".to_owned()),
                 ("Content-Length".to_owned(), "13".to_owned()),
             ],
@@ -726,18 +737,21 @@ async fn redteam_live_mtls_splice_and_upstream_secret_reflection_scrubbing() {
         relayed_wire
     });
 
+    let session = MtlsProxySession {
+        tls_server_config: Arc::clone(&pki.proxy_server_cfg),
+        policy_engine: Arc::clone(&engine),
+        upstream_resolver: Arc::new(StaticEndpointResolver::single(
+            "api.anthropic.com",
+            443,
+            upstream_addr,
+        )),
+        upstream_tls_config: Arc::clone(&pki.proxy_to_upstream_client_cfg),
+        io_timeout: Duration::from_secs(5),
+    };
     let (accepted_tcp, _) = proxy_listener.accept().await.unwrap();
-    let sanitized = handle_mtls_guest_connection(
-        accepted_tcp,
-        Arc::clone(&pki.proxy_server_cfg),
-        &engine,
-        upstream_addr,
-        Arc::clone(&pki.proxy_to_upstream_client_cfg),
-        now_ms,
-        Duration::from_secs(5),
-    )
-    .await
-    .unwrap();
+    let sanitized = handle_mtls_guest_connection(accepted_tcp, 10, &session, now_ms)
+        .await
+        .unwrap();
 
     upstream_task.await.unwrap();
     let guest_received_bytes = guest_task.await.unwrap();
@@ -756,4 +770,259 @@ async fn redteam_live_mtls_splice_and_upstream_secret_reflection_scrubbing() {
     let body_str = std::str::from_utf8(&sanitized.body).unwrap();
     assert!(!body_str.contains("sk-live-secret-999"));
     assert!(body_str.contains("[REDACTED_BY_LOCKSMITH]"));
+}
+
+#[test]
+fn redteam_path_segment_boundary_double_encoding_and_shifted_base64_scrubbing() {
+    use locksmith_proxy::{scrub_secret_reflections, SCRUB_REPLACEMENT_TOKEN};
+
+    // 1. Origin-target must reject double-encoded dot traversal (%252e), empty internal segments (//),
+    //    matrix path parameters (;), and URI fragments (#)
+    for hostile_wire in [
+        b"POST /v1/%252e%252e/admin HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n".as_slice(),
+        b"POST /v1//messages HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n".as_slice(),
+        b"POST /v1/messages;admin=true HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n".as_slice(),
+        b"POST /v1/messages#fragment HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n".as_slice(),
+    ] {
+        assert!(
+            matches!(
+                OutboundHttpRequest::from_wire_bytes(hostile_wire),
+                Err(PolicyError::MalformedHttpRequest { .. })
+            ),
+            "hostile origin-target {:?} must fail closed",
+            String::from_utf8_lossy(hostile_wire)
+        );
+    }
+
+    // 2. Path prefix without trailing slash ("/v1/messages") MUST NOT match sibling "/v1/messages_admin"
+    let pki = build_ephemeral_pki();
+    let unwrapper = Arc::new(SecretUnwrapper::new(
+        HostShare::from_bytes([0x41; 32]),
+        SoftwareTestHsm::new([0x42; 32]),
+    ));
+    let replay = Arc::new(ReplayFilter::with_defaults(64).unwrap());
+    let mut exact_seg_rule = EgressRule {
+        sni_hostname: "api.anthropic.com".to_owned(),
+        port: 443,
+        allowed_methods: vec!["POST".to_owned()],
+        path_prefix: "/v1/messages".to_owned(),
+        secret_id: "anthropic/messages-only".to_owned(),
+        sealed_envelope: anvil_core::unwrap::SealedSecretEnvelope {
+            version: 1,
+            hkdf_salt: [0; 32],
+            nonce: [0; 12],
+            ciphertext_and_tag: vec![0; 16],
+        },
+        injection_header_name: "Authorization".to_owned(),
+        injection_value_prefix: "Bearer ".to_owned(),
+        guest_auth_mode: GuestAuthHeaderMode::Strip,
+    };
+    let p_hash = exact_seg_rule.policy_hash();
+    exact_seg_rule.sealed_envelope = unwrapper
+        .seal(
+            b"sk-live-secret-999",
+            &UnwrapAad {
+                secret_id: "anthropic/messages-only",
+                policy_hash: p_hash,
+                guest_cid: 10,
+            },
+        )
+        .unwrap();
+
+    let strict_engine = PolicyEngine::new(
+        vec![WorkloadIdentity {
+            workload_id: "workload-a".to_owned(),
+            guest_cid: 10,
+            cert_thumbprint_sha256: compute_cert_thumbprint_sha256(&pki.guest_a_cert_der),
+            rules: vec![exact_seg_rule],
+        }],
+        replay,
+        unwrapper,
+    );
+
+    let now_ms = 1_762_000_000_000u64;
+    let sibling_bypass = strict_engine.authorize_egress(EgressAuthorizationInput {
+        workload_id: "workload-a",
+        guest_cid: 10,
+        peer_cert_der: &pki.guest_a_cert_der,
+        sni_hostname: "api.anthropic.com",
+        port: 443,
+        nonce: [0x81; 32],
+        timestamp_ms: now_ms,
+        now_ms,
+        request: OutboundHttpRequest {
+            method: "POST".to_owned(),
+            path_and_query: "/v1/messages_admin".to_owned(),
+            headers: vec![("Host".to_owned(), "api.anthropic.com".to_owned())],
+            body: Vec::new(),
+        },
+    });
+    assert_eq!(
+        sibling_bypass.unwrap_err(),
+        PolicyError::TargetNotAllowed,
+        "/v1/messages_admin must NOT match rule path_prefix /v1/messages"
+    );
+
+    // 3. Shifted Base64 reflection scrubbing across ALL 3 alignments:
+    //    - "Bearer sk-live-secret-999" -> secret starts at byte 7 (1 mod 3)!
+    //    - "Auth:   sk-live-secret-999" -> secret starts at byte 8 (2 mod 3)!
+    let secret = b"sk-live-secret-999";
+    let b64_offset_1 = b"echo_1mod3=QmVhcmVyIHNrLWxpdmUtc2VjcmV0LTk5OQ==";
+    let scrubbed_1 = scrub_secret_reflections(b64_offset_1, secret);
+    assert!(
+        scrubbed_1 != b64_offset_1,
+        "1-mod-3 shifted Base64 ('Bearer <secret>') MUST be scrubbed"
+    );
+    assert!(scrubbed_1
+        .windows(SCRUB_REPLACEMENT_TOKEN.len())
+        .any(|w| w == SCRUB_REPLACEMENT_TOKEN));
+
+    let b64_offset_2 = b"echo_2mod3=QXV0aDogICBza2-nope QXV0aDogICBzay1saXZlLXNlY3JldC05OTk=";
+    let scrubbed_2 = scrub_secret_reflections(b64_offset_2, secret);
+    assert!(
+        !scrubbed_2
+            .windows(b"ay1saXZlLXNlY3JldC05OTk".len())
+            .any(|w| w == b"ay1saXZlLXNlY3JldC05OTk"),
+        "2-mod-3 shifted Base64 ('Auth:   <secret>') MUST be scrubbed"
+    );
+
+    // 4. Single-pass self-matching immunity when secret contains replacement marker substring
+    let tricky_secret = b"LOCKSMITH_SECRET_KEY_1234";
+    let tricky_echo = b"leaked: LOCKSMITH_SECRET_KEY_1234!";
+    let tricky_scrubbed = scrub_secret_reflections(tricky_echo, tricky_secret);
+    assert_eq!(tricky_scrubbed, b"leaked: [REDACTED_BY_LOCKSMITH]!");
+}
+
+#[tokio::test]
+async fn redteam_transport_cid_spoof_port_pinning_and_policy_hash_mode_binding() {
+    let pki = build_ephemeral_pki();
+    let engine = Arc::new(build_test_engine(
+        &pki.guest_a_cert_der,
+        &pki.guest_b_cert_der,
+        b"sk-live-secret-999",
+    ));
+    let now_ms = 1_762_000_000_000u64;
+
+    // 1. Transport peer authenticated as CID 20 spoofing guest_cid=10 in MtlsProxyRequest MUST fail closed
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let (guest_client_io, proxy_server_io) = tokio::io::duplex(32_768);
+
+    let guest_a_cfg = Arc::clone(&pki.guest_a_client_cfg);
+    let spoof_client = tokio::spawn(async move {
+        let connector = TlsConnector::from(guest_a_cfg);
+        let sni = ServerName::try_from("locksmith.internal").unwrap();
+        let mut tls = connector.connect(sni, guest_client_io).await.unwrap();
+        let http = OutboundHttpRequest {
+            method: "POST".to_owned(),
+            path_and_query: "/v1/messages".to_owned(),
+            headers: vec![
+                ("Host".to_owned(), "api.anthropic.com".to_owned()),
+                ("Content-Length".to_owned(), "2".to_owned()),
+            ],
+            body: b"{}".to_vec(),
+        };
+        let req = MtlsProxyRequest {
+            workload_id: "workload-a".to_owned(),
+            guest_cid: 10, // Spoofed! Transport peer is CID 20!
+            sni_hostname: "api.anthropic.com".to_owned(),
+            port: 443,
+            nonce: [0xA1; 32],
+            timestamp_ms: now_ms,
+            raw_http_request: http.to_wire_bytes(),
+        };
+        let encoded = req.to_bytes().unwrap();
+        tls.write_all(&(encoded.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        tls.write_all(&encoded).await.unwrap();
+        tls.flush().await.unwrap();
+        let mut drain = [0u8; 16];
+        let _ = tls.read(&mut drain).await;
+    });
+
+    let session = MtlsProxySession {
+        tls_server_config: Arc::clone(&pki.proxy_server_cfg),
+        policy_engine: Arc::clone(&engine),
+        upstream_resolver: Arc::new(StaticEndpointResolver::single(
+            "api.anthropic.com",
+            443,
+            upstream_addr,
+        )),
+        upstream_tls_config: Arc::clone(&pki.proxy_to_upstream_client_cfg),
+        io_timeout: Duration::from_secs(2),
+    };
+    let cid_err = handle_mtls_guest_connection(proxy_server_io, 20, &session, now_ms)
+        .await
+        .unwrap_err();
+    spoof_client.await.unwrap();
+    assert!(
+        matches!(
+            cid_err,
+            ProxyError::Policy(PolicyError::GuestCidMismatch {
+                expected: 20,
+                actual: 10
+            })
+        ),
+        "unexpected cid_err: {cid_err:?}"
+    );
+
+    // 2. StaticEndpointResolver MUST reject verified_port mismatch (443 vs 8443)
+    let ticket = engine
+        .authorize_egress(EgressAuthorizationInput {
+            workload_id: "workload-a",
+            guest_cid: 10,
+            peer_cert_der: &pki.guest_a_cert_der,
+            sni_hostname: "api.anthropic.com",
+            port: 443,
+            nonce: [0xA2; 32],
+            timestamp_ms: now_ms,
+            now_ms,
+            request: OutboundHttpRequest {
+                method: "POST".to_owned(),
+                path_and_query: "/v1/messages".to_owned(),
+                headers: vec![("Host".to_owned(), "api.anthropic.com".to_owned())],
+                body: Vec::new(),
+            },
+        })
+        .unwrap();
+    let wrong_port_resolver =
+        StaticEndpointResolver::single("api.anthropic.com", 8443, upstream_addr);
+    let port_err = splice_outbound_request(
+        ticket,
+        &wrong_port_resolver,
+        Arc::clone(&pki.proxy_to_upstream_client_cfg),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        port_err,
+        ProxyError::Policy(PolicyError::TargetNotAllowed)
+    ));
+
+    // 3. EgressRule::policy_hash MUST bind guest_auth_mode (Reject != Strip)
+    let rule_reject = EgressRule {
+        sni_hostname: "api.anthropic.com".to_owned(),
+        port: 443,
+        allowed_methods: vec!["POST".to_owned()],
+        path_prefix: "/v1/".to_owned(),
+        secret_id: "anthropic/live".to_owned(),
+        sealed_envelope: anvil_core::unwrap::SealedSecretEnvelope {
+            version: 1,
+            hkdf_salt: [0; 32],
+            nonce: [0; 12],
+            ciphertext_and_tag: vec![0; 16],
+        },
+        injection_header_name: "Authorization".to_owned(),
+        injection_value_prefix: "Bearer ".to_owned(),
+        guest_auth_mode: GuestAuthHeaderMode::Reject,
+    };
+    let mut rule_strip = rule_reject.clone();
+    rule_strip.guest_auth_mode = GuestAuthHeaderMode::Strip;
+    assert_ne!(
+        rule_reject.policy_hash(),
+        rule_strip.policy_hash(),
+        "mutating guest_auth_mode MUST alter policy_hash so AEAD AAD unwrap fails"
+    );
 }

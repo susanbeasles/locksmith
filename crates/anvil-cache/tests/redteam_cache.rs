@@ -126,8 +126,8 @@ fn redteam_key_substitution_swap_attack_fails_closed() {
         .map(|b| format!("{b:02x}"))
         .collect();
 
-    let meta_path_a = root.join("index").join(format!("{key_id_a}.meta"));
-    let meta_path_b = root.join("index").join(format!("{key_id_b}.meta"));
+    let meta_path_a = root.join("index").join(format!("{key_id_a}.entry"));
+    let meta_path_b = root.join("index").join(format!("{key_id_b}.entry"));
 
     let raw_a = std::fs::read(&meta_path_a).unwrap();
     let raw_b = std::fs::read(&meta_path_b).unwrap();
@@ -150,7 +150,14 @@ fn redteam_key_substitution_swap_attack_fails_closed() {
 
 #[test]
 fn redteam_symlink_and_path_traversal_escape_rejected() {
+    use anvil_cache::seal::{open_confined_readonly, validate_relative_cache_path};
+
     let root = fresh_test_root("traversal");
+    let outside_dir = fresh_test_root("outside-victim");
+    let victim_file = outside_dir.join("ring1-secret-canary.txt");
+    let victim_canary = b"RING1_HOST_FILE_MUST_NEVER_BE_OVERWRITTEN";
+    std::fs::write(&victim_file, victim_canary).unwrap();
+
     let store = CacheStore::new(
         CacheStoreConfig {
             root_dir: root.clone(),
@@ -162,39 +169,74 @@ fn redteam_symlink_and_path_traversal_escape_rejected() {
     )
     .unwrap();
 
-    std::fs::create_dir_all(root.join("blobs")).unwrap();
-    let legit_target = root.join("blobs").join("target.txt");
-    std::fs::write(&legit_target, b"inside-root").unwrap();
+    let logical_key = "artifacts/poison-target";
+    let payload = b"attacker-controlled-cache-payload";
+    let blob_hex: String = blake3::hash(payload)
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let key_hex: String = blake3::hash(logical_key.as_bytes())
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
-        // 1. Absolute symlink escaping to /etc/passwd
-        symlink("/etc/passwd", root.join("blobs").join("abs_escape.blob")).unwrap();
-        // 2. Relative symlink inside cache root
-        symlink("target.txt", root.join("blobs").join("rel_link.blob")).unwrap();
-        // 3. Parent-escaping relative symlink
-        symlink(
-            "../../etc/hostname",
-            root.join("blobs").join("up_link.blob"),
-        )
-        .unwrap();
+
+        // 1. Plant symlink at exact content-addressed blob path before CacheStore::put
+        let planted_blob_link = root.join("blobs").join(format!("{blob_hex}.blob"));
+        symlink(&victim_file, &planted_blob_link).unwrap();
 
         assert_eq!(
-            store.get_confined_raw("blobs/abs_escape.blob").unwrap_err(),
-            CacheError::PathViolation
+            store
+                .put(logical_key, payload, &BTreeMap::new())
+                .unwrap_err(),
+            CacheError::PathViolation,
+            "CacheStore::put must reject symlink at blobs/<hex>.blob with PathViolation"
         );
         assert_eq!(
-            store.get_confined_raw("blobs/rel_link.blob").unwrap_err(),
-            CacheError::PathViolation
+            std::fs::read(&victim_file).unwrap(),
+            victim_canary,
+            "CacheStore::put must NEVER follow symlinks or overwrite target files"
+        );
+        std::fs::remove_file(&planted_blob_link).unwrap();
+
+        // 2. Plant symlink at exact index/<hex>.entry path before CacheStore::put and CacheStore::get
+        let planted_entry_link = root.join("index").join(format!("{key_hex}.entry"));
+        symlink(&victim_file, &planted_entry_link).unwrap();
+
+        assert_eq!(
+            store
+                .put(logical_key, payload, &BTreeMap::new())
+                .unwrap_err(),
+            CacheError::PathViolation,
+            "CacheStore::put must reject symlink at index/<hex>.entry with PathViolation"
         );
         assert_eq!(
-            store.get_confined_raw("blobs/up_link.blob").unwrap_err(),
-            CacheError::PathViolation
+            store.get(logical_key).unwrap_err(),
+            CacheError::PathViolation,
+            "CacheStore::get must reject symlink at index/<hex>.entry with PathViolation"
+        );
+        assert_eq!(std::fs::read(&victim_file).unwrap(), victim_canary);
+        std::fs::remove_file(&planted_entry_link).unwrap();
+
+        // 3. Valid put followed by replacing blobs/<hex>.blob with a symlink before CacheStore::get
+        store.put(logical_key, payload, &BTreeMap::new()).unwrap();
+        let real_blob_path = root.join("blobs").join(format!("{blob_hex}.blob"));
+        std::fs::remove_file(&real_blob_path).unwrap();
+        symlink(&victim_file, &real_blob_path).unwrap();
+
+        assert_eq!(
+            store.get(logical_key).unwrap_err(),
+            CacheError::PathViolation,
+            "CacheStore::get must reject symlink at blobs/<hex>.blob with PathViolation"
         );
     }
 
-    // 4. Direct path traversal & malformed components
+    // 4. Direct confined reader & relative path validator reject traversal and non-safe paths
     for bad_path in [
         "../etc/passwd",
         "blobs/../../etc/passwd",
@@ -204,13 +246,18 @@ fn redteam_symlink_and_path_traversal_escape_rejected() {
         "",
     ] {
         assert_eq!(
-            store.get_confined_raw(bad_path).unwrap_err(),
+            validate_relative_cache_path(bad_path).unwrap_err(),
+            CacheError::PathViolation
+        );
+        assert_eq!(
+            open_confined_readonly(&root, bad_path).unwrap_err(),
             CacheError::PathViolation,
             "path '{bad_path}' must fail closed with PathViolation"
         );
     }
 
     let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside_dir);
 }
 
 #[test]

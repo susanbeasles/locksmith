@@ -4,13 +4,16 @@ use std::time::Duration;
 
 use anvil_cache::sanitize::validate_metadata_str;
 use anvil_cache::seal::seal_and_verify_reader;
-use anvil_core::kdf::derive_subkey;
+use anvil_core::kdf::{derive_subkey, DOMAIN_UNWRAP_KEK};
 use anvil_core::ledger::{AuditLedger, LedgerEventInput};
 use anvil_core::replay::ReplayFilter;
-use anvil_core::unwrap::{HostShare, SecretUnwrapper, UnwrapAad};
+use anvil_core::unwrap::{
+    SealedSecretEnvelope, UnwrapAad, ENVELOPE_VERSION_V1, MAX_ENVELOPE_CIPHERTEXT_BYTES,
+};
 use anvil_core::{CryptoError, ReplayError};
 use anvil_ipc::frame::read_bounded_frame;
 use anvil_ipc::IpcError;
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use aws_lc_rs::constant_time::verify_slices_are_equal;
 use locksmith_proxy::{
     scrub_secret_reflections, OutboundHttpRequest, PolicyError, SCRUB_REPLACEMENT_TOKEN,
@@ -20,7 +23,7 @@ use zeroize::Zeroizing;
 
 use crate::error::DaemonError;
 use crate::harden::{harden_process, is_process_nondumpable};
-use crate::hsm::{serve_ring0_hmac_stream, ConnectedRing0StreamUnwrapper};
+use crate::hsm::exchange_ring0_challenge;
 
 /// Summary of deterministic startup self-tests (`locksmith-daemon verify-self`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,19 +48,133 @@ fn hex_encode_32(bytes: &[u8; 32]) -> String {
     out
 }
 
-fn current_effective_uid() -> u32 {
+fn verify_production_2of2_aead_and_ring0_guards() -> Result<(), DaemonError> {
+    let mut ephemeral = Zeroizing::new([0u8; 108]);
+    aws_lc_rs::rand::fill(&mut *ephemeral).map_err(|_| CryptoError::RngFailure)?;
+
+    let mut host_share = Zeroizing::new([0u8; 32]);
+    host_share.copy_from_slice(&ephemeral[0..32]);
+    let mut hw_share = Zeroizing::new([0u8; 32]);
+    hw_share.copy_from_slice(&ephemeral[32..64]);
+    let mut hkdf_salt = [0u8; 32];
+    hkdf_salt.copy_from_slice(&ephemeral[64..96]);
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes.copy_from_slice(&ephemeral[96..108]);
+
+    let aad = UnwrapAad {
+        secret_id: "selftest/kat",
+        policy_hash: [0x7E; 32],
+        guest_cid: 3,
+    };
+    let canonical_aad = aad.encode_canonical()?;
+    let kek = derive_subkey(
+        &hkdf_salt,
+        &*host_share,
+        &[DOMAIN_UNWRAP_KEK, &*hw_share, &canonical_aad],
+    )?;
+
+    let kat_plaintext = Zeroizing::new(*b"kat-ephemeral-secret-vector-v1!!");
+    let unbound_seal =
+        UnboundKey::new(&CHACHA20_POLY1305, &*kek).map_err(|_| CryptoError::KeyDerivationFailed)?;
+    let seal_key = LessSafeKey::new(unbound_seal);
+    let mut ct = kat_plaintext.to_vec();
+    seal_key
+        .seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce_bytes),
+            Aad::from(&canonical_aad),
+            &mut ct,
+        )
+        .map_err(|_| CryptoError::AuthenticationFailed)?;
+
+    let envelope = SealedSecretEnvelope {
+        version: ENVELOPE_VERSION_V1,
+        hkdf_salt,
+        nonce: nonce_bytes,
+        ciphertext_and_tag: ct,
+    };
+    let wire = envelope.to_bytes();
+    let parsed = SealedSecretEnvelope::from_bytes(&wire)?;
+
+    // Oversized (> 64 KiB) envelope wire payload must fail closed before unwrapping
+    let oversized_len = (MAX_ENVELOPE_CIPHERTEXT_BYTES + 1) as u32;
+    let mut oversized_wire = vec![ENVELOPE_VERSION_V1];
+    oversized_wire.extend_from_slice(&hkdf_salt);
+    oversized_wire.extend_from_slice(&nonce_bytes);
+    oversized_wire.extend_from_slice(&oversized_len.to_be_bytes());
+    oversized_wire.resize(1 + 32 + 12 + 4 + MAX_ENVELOPE_CIPHERTEXT_BYTES + 1, 0u8);
+    if SealedSecretEnvelope::from_bytes(&oversized_wire) != Err(CryptoError::InvalidEnvelopeFormat)
+    {
+        return Err(DaemonError::SelfTestFailed {
+            check: "envelope_size_cap",
+            detail: "oversized SealedSecretEnvelope was not rejected".to_owned(),
+        });
+    }
+
+    // 1-bit ciphertext tamper must fail AEAD authentication
+    let mut tampered = parsed.clone().ciphertext_and_tag;
+    if let Some(b) = tampered.first_mut() {
+        *b ^= 0x01;
+    }
+    let unbound_tamper =
+        UnboundKey::new(&CHACHA20_POLY1305, &*kek).map_err(|_| CryptoError::KeyDerivationFailed)?;
+    if LessSafeKey::new(unbound_tamper)
+        .open_in_place(
+            Nonce::assume_unique_for_key(parsed.nonce),
+            Aad::from(&canonical_aad),
+            &mut tampered,
+        )
+        .is_ok()
+    {
+        return Err(DaemonError::SelfTestFailed {
+            check: "aead_tamper_reject",
+            detail: "1-bit tampered ChaCha20-Poly1305 ciphertext did not fail closed".to_owned(),
+        });
+    }
+
+    // Valid open recovers exact plaintext
+    let mut opened_buf = Zeroizing::new(parsed.ciphertext_and_tag);
+    let unbound_open =
+        UnboundKey::new(&CHACHA20_POLY1305, &*kek).map_err(|_| CryptoError::KeyDerivationFailed)?;
+    let opened = LessSafeKey::new(unbound_open)
+        .open_in_place(
+            Nonce::assume_unique_for_key(parsed.nonce),
+            Aad::from(&canonical_aad),
+            &mut opened_buf,
+        )
+        .map_err(|_| CryptoError::AuthenticationFailed)?;
+    if verify_slices_are_equal(opened, &*kat_plaintext).is_err() {
+        return Err(DaemonError::SelfTestFailed {
+            check: "aead_2of2_unwrap",
+            detail: "decrypted ChaCha20-Poly1305 plaintext mismatch".to_owned(),
+        });
+    }
+
+    // Production Ring 0 client must enforce SO_PEERCRED UID match and reject closed/rogue peers
     #[cfg(target_os = "linux")]
     {
-        rustix::process::getuid().as_raw()
+        let current_uid = rustix::process::getuid().as_raw();
+        let (mut client_sock, _server_sock) =
+            StdUnixStream::pair().map_err(|e| DaemonError::Io(e.to_string()))?;
+        let wrong_uid_res = exchange_ring0_challenge(
+            &mut client_sock,
+            current_uid.wrapping_add(1),
+            Duration::from_millis(200),
+            b"LOCKSMITH-CHALLENGE",
+        );
+        if wrong_uid_res != Err(CryptoError::HardwareFailure) {
+            return Err(DaemonError::SelfTestFailed {
+                check: "ring0_peercred_guard",
+                detail: "Ring 0 SO_PEERCRED UID mismatch did not fail closed".to_owned(),
+            });
+        }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0
-    }
+
+    Ok(())
 }
 
 /// Executes deterministic in-RAM Known-Answer Tests across every Locksmith subsystem
-/// without touching the filesystem (compatible with `--read-only` containers).
+/// without touching the filesystem (compatible with `--read-only` containers) and
+/// without compiling any software mock HSM into production binaries.
 pub async fn run_self_test() -> Result<SelfTestReport, DaemonError> {
     // 1. OS Process Hardening (PR_SET_DUMPABLE = 0)
     harden_process()?;
@@ -84,67 +201,23 @@ pub async fn run_self_test() -> Result<SelfTestReport, DaemonError> {
         });
     }
 
-    // 3. 2-of-2 AEAD Unwrap + Tamper Rejection over in-RAM SO_PEERCRED Ring 0 socketpair
-    let mut ephemeral_shares = Zeroizing::new([0u8; 64]);
-    aws_lc_rs::rand::fill(&mut *ephemeral_shares).map_err(|_| CryptoError::RngFailure)?;
-    let mut host_bytes = [0u8; 32];
-    host_bytes.copy_from_slice(&ephemeral_shares[0..32]);
-    let mut ring0_bytes = Zeroizing::new([0u8; 32]);
-    ring0_bytes.copy_from_slice(&ephemeral_shares[32..64]);
+    // 3. Production 2-of-2 ChaCha20-Poly1305 Envelope + Ring 0 SO_PEERCRED Guard KAT
+    tokio::task::spawn_blocking(verify_production_2of2_aead_and_ring0_guards)
+        .await
+        .map_err(|e| DaemonError::Io(e.to_string()))??;
 
-    let (client_sock, server_sock) =
-        StdUnixStream::pair().map_err(|e| DaemonError::Io(e.to_string()))?;
-    let uid = current_effective_uid();
-    // 3 challenges served: 1 for seal(), 1 for tampered unwrap(), 1 for valid unwrap()
-    let ring0_thread =
-        std::thread::spawn(move || serve_ring0_hmac_stream(server_sock, ring0_bytes, uid, 3));
-
-    let ring0_client = ConnectedRing0StreamUnwrapper::new(client_sock, uid, Duration::from_secs(2));
-    let unwrapper = SecretUnwrapper::new(HostShare::from_bytes(host_bytes), ring0_client);
-    let kat_plaintext = Zeroizing::new(*b"kat-ephemeral-secret-vector-v1!!");
-    let aad = UnwrapAad {
-        secret_id: "selftest/kat",
-        policy_hash: [0x7E; 32],
-        guest_cid: 3,
-    };
-
-    let (tampered_res, valid_res) = tokio::task::spawn_blocking(move || {
-        let sealed = unwrapper.seal(&*kat_plaintext, &aad)?;
-        let mut tampered = sealed.clone();
-        if let Some(first) = tampered.ciphertext_and_tag.first_mut() {
-            *first ^= 0x01;
-        }
-        let t_res = unwrapper.unwrap_envelope(&tampered, &aad);
-        let v_res = unwrapper.unwrap_envelope(&sealed, &aad)?;
-        let ok_eq = verify_slices_are_equal(v_res.expose_secret(), &*kat_plaintext).is_ok();
-        Ok::<(Result<_, CryptoError>, bool), CryptoError>((t_res, ok_eq))
-    })
-    .await
-    .map_err(|e| DaemonError::Io(e.to_string()))??;
-
-    let thread_res = ring0_thread
-        .join()
-        .map_err(|_| DaemonError::SelfTestFailed {
-            check: "ring0_socketpair",
-            detail: "Ring 0 KAT responder panicked".to_owned(),
-        })?;
-    thread_res?;
-
-    if tampered_res.err() != Some(CryptoError::AuthenticationFailed) || !valid_res {
-        return Err(DaemonError::SelfTestFailed {
-            check: "aead_2of2_unwrap",
-            detail: "2-of-2 ChaCha20-Poly1305 KAT failed".to_owned(),
-        });
-    }
-
-    // 4. Single-Use Nonce Replay Filter & Append-Only BLAKE3 Audit Ledger KAT
+    // 4. Single-Use Nonce Replay Filter (including future-pinned front guard) & Audit Ledger KAT
     let replay = ReplayFilter::with_defaults(16)?;
     let kat_now = 1_762_000_000_000u64;
-    replay.check_and_burn([0x44; 32], kat_now, kat_now)?;
-    if replay.check_and_burn([0x44; 32], kat_now, kat_now) != Err(ReplayError::NonceAlreadyBurned) {
+    // Future-pin queue front (+30s) then burn second nonce (-29s) and verify no premature eviction at +35s
+    replay.check_and_burn([0x43; 32], kat_now + 30_000, kat_now)?;
+    replay.check_and_burn([0x44; 32], kat_now - 29_000, kat_now)?;
+    if replay.check_and_burn([0x44; 32], kat_now + 35_000, kat_now + 35_000)
+        != Err(ReplayError::NonceAlreadyBurned)
+    {
         return Err(DaemonError::SelfTestFailed {
             check: "replay_filter",
-            detail: "duplicate nonce was not rejected".to_owned(),
+            detail: "future-pinned front allowed premature nonce double-spend".to_owned(),
         });
     }
 
@@ -156,7 +229,7 @@ pub async fn run_self_test() -> Result<SelfTestReport, DaemonError> {
         summary: "executing deterministic startup KAT suite",
     })?;
 
-    // 5. Cache Kernel memfd Seal & Prompt-Injection Metadata Sanitizer KAT
+    // 5. Cache Kernel memfd Seal (fail-closed on Linux) & Prompt-Injection Metadata Sanitizer KAT
     if validate_metadata_str("clean-cache-metadata-v1").is_err()
         || validate_metadata_str("poison\u{E0041}\x1b]0;spoof\x07").is_ok()
     {
@@ -175,6 +248,13 @@ pub async fn run_self_test() -> Result<SelfTestReport, DaemonError> {
             }
             Ok(())
         })?;
+    #[cfg(target_os = "linux")]
+    if !sealed_blob.is_kernel_sealed() {
+        return Err(DaemonError::SelfTestFailed {
+            check: "cache_memfd_seal",
+            detail: "Linux kernel memfd F_ADD_SEALS was not active".to_owned(),
+        });
+    }
     if sealed_blob.read_to_vec()? != ram_payload {
         return Err(DaemonError::SelfTestFailed {
             check: "cache_memfd_seal",
@@ -201,7 +281,7 @@ pub async fn run_self_test() -> Result<SelfTestReport, DaemonError> {
         });
     }
 
-    // 7. Proxy RFC 9110/9112 Smuggling Rejector & Secret Reflection Scrubber KAT
+    // 7. Proxy RFC 9110/9112 Smuggling Rejector & Multi-Alignment Base64 Scrubber KAT
     let smuggled_wire =
         b"POST /v1/messages HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}";
     if OutboundHttpRequest::from_wire_bytes(smuggled_wire)
@@ -213,21 +293,26 @@ pub async fn run_self_test() -> Result<SelfTestReport, DaemonError> {
         });
     }
 
-    let canary = b"kat-reflection-canary+123/";
-    let scrubbed = scrub_secret_reflections(
-        b"502 upstream echo: kat-reflection-canary+123/ and a2F0LXJlZmxlY3Rpb24tY2FuYXJ5KzEyMy8=",
-        canary,
-    );
-    if scrubbed
-        .windows(canary.len())
-        .any(|window| window == canary)
-        || !scrubbed
+    let canary = b"sk-live-secret-999";
+    // Includes raw, 0-mod-3 Base64, 1-mod-3 ("Bearer <canary>"), and 2-mod-3 ("Auth:   <canary>")
+    let multi_echo = b"raw=sk-live-secret-999 b0=c2stbGl2ZS1zZWNyZXQtOTk5 b1=QmVhcmVyIHNrLWxpdmUtc2VjcmV0LTk5OQ== b2=QXV0aDogICBzay1saXZlLXNlY3JldC05OTk=";
+    let scrubbed = scrub_secret_reflections(multi_echo, canary);
+    if scrubbed.windows(canary.len()).any(|w| w == canary)
+        || scrubbed
+            .windows(b"NrLWxpdmUtc2VjcmV0LTk5O".len())
+            .any(|w| w == b"NrLWxpdmUtc2VjcmV0LTk5O")
+        || scrubbed
+            .windows(b"zay1saXZlLXNlY3JldC05OT".len())
+            .any(|w| w == b"zay1saXZlLXNlY3JldC05OT")
+        || scrubbed
             .windows(SCRUB_REPLACEMENT_TOKEN.len())
-            .any(|window| window == SCRUB_REPLACEMENT_TOKEN)
+            .filter(|&w| w == SCRUB_REPLACEMENT_TOKEN)
+            .count()
+            < 4
     {
         return Err(DaemonError::SelfTestFailed {
             check: "proxy_reflection_scrubber",
-            detail: "secret reflection scrubber failed to redact raw/base64 canary".to_owned(),
+            detail: "secret reflection scrubber failed raw or 0/1/2-mod-3 Base64 KAT".to_owned(),
         });
     }
 

@@ -10,10 +10,11 @@ pub mod ticket;
 pub use error::{PolicyError, ProxyError};
 pub use policy::{
     compute_cert_thumbprint_sha256, EgressAuthorizationInput, EgressRule, GuestAuthHeaderMode,
-    OutboundHttpRequest, PolicyEngine, WorkloadIdentity,
+    OutboundHttpRequest, PolicyEngine, WorkloadIdentity, MIN_INJECTED_SECRET_BYTES,
 };
 pub use splicer::{
-    scrub_secret_reflections, splice_outbound_request, MtlsProxyRequest, SanitizedHttpResponse,
-    SCRUB_REPLACEMENT_TOKEN,
+    handle_mtls_guest_connection, scrub_secret_reflections, splice_outbound_request,
+    MtlsProxyRequest, MtlsProxySession, SanitizedHttpResponse, StaticEndpointResolver,
+    SystemDnsResolver, UpstreamResolver, SCRUB_REPLACEMENT_TOKEN,
 };
 pub use ticket::ApprovedEgressTicket;

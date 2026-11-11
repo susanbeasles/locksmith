@@ -8,5 +8,5 @@ pub mod seal;
 pub mod store;
 
 pub use error::{CacheError, SanitizeError};
-pub use seal::VerifiedReadOnlyBlob;
+pub use seal::{SealPolicy, VerifiedReadOnlyBlob};
 pub use store::{CacheHit, CacheStore, CacheStoreConfig};

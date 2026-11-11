@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use aws_lc_rs::constant_time::verify_slices_are_equal;
@@ -9,6 +10,9 @@ pub const GENESIS_PREV_HASH: [u8; 32] = [0u8; 32];
 
 /// Canonical version tag inside serialized [`LedgerEntry`] event bytes.
 pub const LEDGER_DOMAIN_TAG: &[u8] = b"LOCKSMITH-LEDGER-V1";
+
+/// Default upper bound on in-memory retained [`LedgerEntry`] records (`4,096`).
+pub const DEFAULT_MAX_RETAINED_ENTRIES: usize = 4_096;
 
 /// Input fields for appending a redacted structured audit event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,11 +131,15 @@ impl LedgerEntry {
 
 #[derive(Debug)]
 struct LedgerState {
-    entries: Vec<LedgerEntry>,
+    entries: VecDeque<LedgerEntry>,
+    max_retained_entries: usize,
+    next_sequence: u64,
+    retained_anchor_prev_hash: [u8; 32],
     head_hash: [u8; 32],
 }
 
-/// Thread-safe append-only `BLAKE3` hash-chained event ledger.
+/// Thread-safe append-only `BLAKE3` hash-chained event ledger with bounded
+/// in-memory retention and continuous cryptographic anchoring.
 #[derive(Debug)]
 pub struct AuditLedger {
     state: Mutex<LedgerState>,
@@ -144,22 +152,42 @@ impl Default for AuditLedger {
 }
 
 impl AuditLedger {
-    /// Creates an empty [`AuditLedger`] anchored at [`GENESIS_PREV_HASH`].
+    /// Creates an empty [`AuditLedger`] anchored at [`GENESIS_PREV_HASH`] with
+    /// [`DEFAULT_MAX_RETAINED_ENTRIES`] in-memory capacity.
     #[must_use]
     pub fn new() -> Self {
         Self {
             state: Mutex::new(LedgerState {
-                entries: Vec::new(),
+                entries: VecDeque::new(),
+                max_retained_entries: DEFAULT_MAX_RETAINED_ENTRIES,
+                next_sequence: 0,
+                retained_anchor_prev_hash: GENESIS_PREV_HASH,
                 head_hash: GENESIS_PREV_HASH,
             }),
         }
     }
 
+    /// Creates an [`AuditLedger`] with an explicit non-zero retention bound.
+    pub fn with_max_retained_entries(max_retained_entries: usize) -> Result<Self, LedgerError> {
+        if max_retained_entries == 0 {
+            return Err(LedgerError::StateCorrupted);
+        }
+        Ok(Self {
+            state: Mutex::new(LedgerState {
+                entries: VecDeque::new(),
+                max_retained_entries,
+                next_sequence: 0,
+                retained_anchor_prev_hash: GENESIS_PREV_HASH,
+                head_hash: GENESIS_PREV_HASH,
+            }),
+        })
+    }
+
     /// Appends a new event to the hash chain and returns the committed [`LedgerEntry`].
     pub fn append(&self, event: LedgerEventInput<'_>) -> Result<LedgerEntry, LedgerError> {
         let mut guard = self.state.lock().map_err(|_| LedgerError::StateCorrupted)?;
-        let sequence =
-            u64::try_from(guard.entries.len()).map_err(|_| LedgerError::StateCorrupted)?;
+        let sequence = guard.next_sequence;
+        let next_sequence = sequence.checked_add(1).ok_or(LedgerError::StateCorrupted)?;
         let prev_hash = guard.head_hash;
 
         let entry_hash = stream_entry_hash(
@@ -181,15 +209,34 @@ impl AuditLedger {
             entry_hash,
         };
 
+        if guard.entries.len() >= guard.max_retained_entries {
+            if let Some(evicted) = guard.entries.pop_front() {
+                guard.retained_anchor_prev_hash = evicted.entry_hash;
+            }
+        }
+
+        guard.next_sequence = next_sequence;
         guard.head_hash = entry_hash;
-        guard.entries.push(entry.clone());
+        guard.entries.push_back(entry.clone());
         Ok(entry)
     }
 
-    /// Returns a cloned snapshot of all committed entries.
+    /// Returns a cloned snapshot of all currently retained entries.
     pub fn entries_snapshot(&self) -> Result<Vec<LedgerEntry>, LedgerError> {
         let guard = self.state.lock().map_err(|_| LedgerError::StateCorrupted)?;
-        Ok(guard.entries.clone())
+        Ok(guard.entries.iter().cloned().collect())
+    }
+
+    /// Returns the total number of committed events since genesis.
+    pub fn total_committed(&self) -> Result<u64, LedgerError> {
+        let guard = self.state.lock().map_err(|_| LedgerError::StateCorrupted)?;
+        Ok(guard.next_sequence)
+    }
+
+    /// Returns the `prev_hash` anchoring the oldest retained entry in memory.
+    pub fn retained_anchor_prev_hash(&self) -> Result<[u8; 32], LedgerError> {
+        let guard = self.state.lock().map_err(|_| LedgerError::StateCorrupted)?;
+        Ok(guard.retained_anchor_prev_hash)
     }
 
     /// Returns the latest committed `entry_hash` (or [`GENESIS_PREV_HASH`] if empty).
@@ -198,10 +245,20 @@ impl AuditLedger {
         Ok(guard.head_hash)
     }
 
-    /// Verifies the full ledger starting from [`GENESIS_PREV_HASH`].
+    /// Verifies the retained ledger window starting from `retained_anchor_prev_hash`
+    /// and confirms the tail matches `head_hash`.
     pub fn verify_all(&self) -> Result<(), LedgerError> {
         let guard = self.state.lock().map_err(|_| LedgerError::StateCorrupted)?;
-        Self::verify_slice(&GENESIS_PREV_HASH, &guard.entries)
+        let snapshot: Vec<LedgerEntry> = guard.entries.iter().cloned().collect();
+        Self::verify_slice(&guard.retained_anchor_prev_hash, &snapshot)?;
+        if let Some(last) = snapshot.last() {
+            if verify_slices_are_equal(&last.entry_hash, &guard.head_hash).is_err() {
+                return Err(LedgerError::EntryHashTampered {
+                    sequence: last.sequence,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Verifies integrity and hash linkage across any contiguous slice of [`LedgerEntry`] records.

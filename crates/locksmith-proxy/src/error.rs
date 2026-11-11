@@ -29,6 +29,8 @@ pub enum PolicyError {
     Replay(ReplayError),
     /// 2-of-2 hardware-attested secret unwrap failed.
     UnwrapFailed(CryptoError),
+    /// Unwrapped secret is shorter than `MIN_INJECTED_SECRET_BYTES`.
+    SecretTooShort { min_bytes: usize },
 }
 
 impl From<ReplayError> for PolicyError {
@@ -77,6 +79,10 @@ impl fmt::Display for PolicyError {
             }
             Self::Replay(err) => write!(f, "egress nonce replay rejected: {err}"),
             Self::UnwrapFailed(err) => write!(f, "egress credential unwrap failed: {err}"),
+            Self::SecretTooShort { min_bytes } => write!(
+                f,
+                "unwrapped egress credential shorter than minimum {min_bytes} bytes"
+            ),
         }
     }
 }

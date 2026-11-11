@@ -10,6 +10,11 @@ publish.workspace = true
 name = "locksmith-daemon"
 path = "src/main.rs"
 
+[features]
+default = []
+test-hsm = ["anvil-core/test-hsm"]
+prod-strict = ["anvil-core/prod-strict"]
+
 [dependencies]
 anvil-cache = { path = "../anvil-cache" }
 anvil-core = { path = "../anvil-core" }
@@ -24,6 +29,8 @@ zeroize.workspace = true
 
 [dev-dependencies]
 anvil-core = { path = "../anvil-core", features = ["test-hsm"] }
+locksmith-daemon = { path = ".", features = ["test-hsm"] }
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

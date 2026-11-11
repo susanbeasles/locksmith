@@ -7,7 +7,10 @@ use aws_lc_rs::digest::{digest, SHA256};
 use zeroize::Zeroizing;
 
 use crate::error::PolicyError;
-use crate::ticket::ApprovedEgressTicket;
+use crate::ticket::{ApprovedEgressTicket, TicketMintParams};
+
+/// Minimum unwrapped secret byte length permitted for egress injection.
+pub const MIN_INJECTED_SECRET_BYTES: usize = 8;
 
 /// Policy disposition when an untrusted guest supplies `Authorization` or
 /// `Proxy-Authorization` headers on an outbound request.
@@ -41,24 +44,30 @@ impl EgressRule {
         let mut sorted_methods = self.allowed_methods.clone();
         sorted_methods.sort();
 
+        let mode_byte = match self.guest_auth_mode {
+            GuestAuthHeaderMode::Reject => 0u8,
+            GuestAuthHeaderMode::Strip => 1u8,
+        };
+
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"LOCKSMITH-POLICY-RULE-V1");
-        hasher.update(&(self.sni_hostname.len() as u32).to_be_bytes());
+        hasher.update(&(self.sni_hostname.len() as u64).to_be_bytes());
         hasher.update(self.sni_hostname.as_bytes());
         hasher.update(&self.port.to_be_bytes());
-        hasher.update(&(sorted_methods.len() as u32).to_be_bytes());
+        hasher.update(&(sorted_methods.len() as u64).to_be_bytes());
         for m in &sorted_methods {
-            hasher.update(&(m.len() as u32).to_be_bytes());
+            hasher.update(&(m.len() as u64).to_be_bytes());
             hasher.update(m.as_bytes());
         }
-        hasher.update(&(self.path_prefix.len() as u32).to_be_bytes());
+        hasher.update(&(self.path_prefix.len() as u64).to_be_bytes());
         hasher.update(self.path_prefix.as_bytes());
-        hasher.update(&(self.secret_id.len() as u32).to_be_bytes());
+        hasher.update(&(self.secret_id.len() as u64).to_be_bytes());
         hasher.update(self.secret_id.as_bytes());
-        hasher.update(&(self.injection_header_name.len() as u32).to_be_bytes());
+        hasher.update(&(self.injection_header_name.len() as u64).to_be_bytes());
         hasher.update(self.injection_header_name.as_bytes());
-        hasher.update(&(self.injection_value_prefix.len() as u32).to_be_bytes());
+        hasher.update(&(self.injection_value_prefix.len() as u64).to_be_bytes());
         hasher.update(self.injection_value_prefix.as_bytes());
+        hasher.update(&[mode_byte]);
         *hasher.finalize().as_bytes()
     }
 }
@@ -84,7 +93,7 @@ pub struct OutboundHttpRequest {
 /// Maximum raw HTTP/1.1 wire request size accepted from a Ring 2 guest (`256 KiB`).
 pub const MAX_HTTP_WIRE_BYTES: usize = 262_144;
 
-const fn is_tchar(b: u8) -> bool {
+pub(crate) const fn is_tchar(b: u8) -> bool {
     matches!(
         b,
         b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
@@ -122,24 +131,106 @@ fn validate_header_value(value: &str) -> Result<(), PolicyError> {
     Ok(())
 }
 
-fn contains_encoded_traversal(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i + 2 < bytes.len() {
+const fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn verify_rfc3986_percent_syntax(bytes: &[u8]) -> Result<(), PolicyError> {
+    let mut i = 0usize;
+    while i < bytes.len() {
         if bytes[i] == b'%' {
-            let hi = bytes[i + 1].to_ascii_lowercase();
-            let lo = bytes[i + 2].to_ascii_lowercase();
-            // Reject %2e ('.'), %2f ('/'), %5c ('\\'), and %00 (NUL)
-            if (hi == b'2' && (lo == b'e' || lo == b'f'))
-                || (hi == b'5' && lo == b'c')
-                || (hi == b'0' && lo == b'0')
-            {
-                return true;
+            let Some(&hi) = bytes.get(i + 1) else {
+                return Err(PolicyError::MalformedHttpRequest {
+                    reason: "truncated percent-encoding in request-target",
+                });
+            };
+            let Some(&lo) = bytes.get(i + 2) else {
+                return Err(PolicyError::MalformedHttpRequest {
+                    reason: "truncated percent-encoding in request-target",
+                });
+            };
+            if hex_nibble(hi).is_none() || hex_nibble(lo).is_none() {
+                return Err(PolicyError::MalformedHttpRequest {
+                    reason: "malformed hex digit in percent-encoded request-target",
+                });
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn percent_decode_once(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let (Some(&hi), Some(&lo)) = (bytes.get(i + 1), bytes.get(i + 2)) {
+                if let (Some(h), Some(l)) = (hex_nibble(hi), hex_nibble(lo)) {
+                    out.push((h << 4) | l);
+                    i += 3;
+                    continue;
+                }
             }
         }
+        out.push(bytes[i]);
         i += 1;
     }
-    false
+    out
+}
+
+fn validate_path_segment_no_hidden_traversal(seg: &str) -> Result<(), PolicyError> {
+    if seg == "." || seg == ".." {
+        return Err(PolicyError::MalformedHttpRequest {
+            reason: "dot-segment traversal in request path",
+        });
+    }
+    let mut cur = seg.as_bytes().to_vec();
+    for pass in 0..8 {
+        let next = percent_decode_once(&cur);
+        for &b in &next {
+            if b <= 0x20 || b >= 0x7F || matches!(b, b'/' | b'\\' | b';' | b'#' | b'?') {
+                return Err(PolicyError::MalformedHttpRequest {
+                    reason: "percent-encoded separator or control byte in request path",
+                });
+            }
+        }
+        if next.as_slice() == b"." || next.as_slice() == b".." {
+            return Err(PolicyError::MalformedHttpRequest {
+                reason: "percent-encoded dot-segment traversal in request path",
+            });
+        }
+        if next == cur {
+            return Ok(());
+        }
+        if pass == 7 {
+            return Err(PolicyError::MalformedHttpRequest {
+                reason: "excessive nested percent-encoding in request path",
+            });
+        }
+        cur = next;
+    }
+    Ok(())
+}
+
+fn path_matches_prefix_boundary(normalized_path: &str, rule_prefix: &str) -> bool {
+    if rule_prefix.is_empty() || !rule_prefix.starts_with('/') {
+        return false;
+    }
+    if rule_prefix.ends_with('/') {
+        normalized_path.starts_with(rule_prefix)
+    } else {
+        normalized_path == rule_prefix
+            || (normalized_path.starts_with(rule_prefix)
+                && normalized_path.as_bytes().get(rule_prefix.len()) == Some(&b'/'))
+    }
 }
 
 fn validate_method(method: &str) -> Result<String, PolicyError> {
@@ -157,6 +248,11 @@ fn validate_origin_target(target: &str) -> Result<&str, PolicyError> {
             reason: "HTTP request-target must be origin-form starting with single '/'",
         });
     }
+    if target.contains('#') {
+        return Err(PolicyError::MalformedHttpRequest {
+            reason: "URI fragment '#' forbidden in HTTP/1.1 origin-form request-target",
+        });
+    }
     for b in target.bytes() {
         if b <= 0x20 || b >= 0x7F || b == b'\\' {
             return Err(PolicyError::MalformedHttpRequest {
@@ -164,18 +260,21 @@ fn validate_origin_target(target: &str) -> Result<&str, PolicyError> {
             });
         }
     }
+    verify_rfc3986_percent_syntax(target.as_bytes())?;
+
     let path_only = target.split('?').next().unwrap_or(target);
-    if contains_encoded_traversal(path_only) {
+    if path_only.contains("//") {
         return Err(PolicyError::MalformedHttpRequest {
-            reason: "percent-encoded traversal sequence in request path",
+            reason: "ambiguous empty internal path segment '//' in request path",
+        });
+    }
+    if path_only.contains(';') {
+        return Err(PolicyError::MalformedHttpRequest {
+            reason: "matrix path parameter ';' forbidden in request path",
         });
     }
     for seg in path_only.split('/') {
-        if seg == "." || seg == ".." {
-            return Err(PolicyError::MalformedHttpRequest {
-                reason: "dot-segment traversal in request path",
-            });
-        }
+        validate_path_segment_no_hidden_traversal(seg)?;
     }
     Ok(path_only)
 }
@@ -411,6 +510,12 @@ impl<H: HardwareUnwrapper> PolicyEngine<H> {
         }
     }
 
+    /// Returns the number of statically registered workload identities.
+    #[must_use]
+    pub fn workload_count(&self) -> usize {
+        self.workloads.len()
+    }
+
     /// Validates all 5 security gates and mints a single-use [`ApprovedEgressTicket`].
     pub fn authorize_egress(
         &self,
@@ -473,7 +578,7 @@ impl<H: HardwareUnwrapper> PolicyEngine<H> {
             return Err(PolicyError::HostSniMismatch);
         }
 
-        // Gate 3: Static workload egress allowlist match
+        // Gate 3: Static workload egress allowlist match (with strict path-segment boundary)
         let rule = workload
             .rules
             .iter()
@@ -483,7 +588,7 @@ impl<H: HardwareUnwrapper> PolicyEngine<H> {
                     && r.allowed_methods
                         .iter()
                         .any(|m| m.eq_ignore_ascii_case(&normalized_method))
-                    && normalized_path.starts_with(&r.path_prefix)
+                    && path_matches_prefix_boundary(normalized_path, &r.path_prefix)
             })
             .ok_or(PolicyError::TargetNotAllowed)?;
 
@@ -508,6 +613,9 @@ impl<H: HardwareUnwrapper> PolicyEngine<H> {
             if name.eq_ignore_ascii_case("host")
                 || name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("connection")
+                || name.eq_ignore_ascii_case("accept-encoding")
+                || name.eq_ignore_ascii_case("te")
+                || name.eq_ignore_ascii_case("range")
             {
                 continue;
             }
@@ -530,7 +638,7 @@ impl<H: HardwareUnwrapper> PolicyEngine<H> {
         }
 
         let cl_line = format!(
-            "Content-Length: {}\r\nConnection: close\r\n",
+            "Accept-Encoding: identity\r\nContent-Length: {}\r\nConnection: close\r\n",
             input.request.body.len()
         );
         canonical_prefix.extend_from_slice(cl_line.as_bytes());
@@ -550,6 +658,12 @@ impl<H: HardwareUnwrapper> PolicyEngine<H> {
             .unwrapper
             .unwrap_envelope(&rule.sealed_envelope, &aad)?;
 
+        if raw_secret.expose_secret().len() < MIN_INJECTED_SECRET_BYTES {
+            return Err(PolicyError::SecretTooShort {
+                min_bytes: MIN_INJECTED_SECRET_BYTES,
+            });
+        }
+
         let secret_str = std::str::from_utf8(raw_secret.expose_secret())
             .map_err(|_| anvil_core::CryptoError::AuthenticationFailed)?;
         validate_header_value(secret_str)?;
@@ -560,17 +674,17 @@ impl<H: HardwareUnwrapper> PolicyEngine<H> {
         header_val.push_str(secret_str);
         let injection_header_value = Zeroizing::new(header_val);
 
-        Ok(ApprovedEgressTicket::mint(
-            workload.workload_id.clone(),
-            workload.guest_cid,
-            normalized_sni,
-            input.port,
-            canonical_prefix,
-            input.request.body,
-            rule.injection_header_name.clone(),
+        Ok(ApprovedEgressTicket::mint(TicketMintParams {
+            workload_id: workload.workload_id.clone(),
+            guest_cid: workload.guest_cid,
+            verified_sni: normalized_sni,
+            verified_port: input.port,
+            canonical_request_prefix: canonical_prefix,
+            request_body: input.request.body,
+            injection_header_name: rule.injection_header_name.clone(),
             injection_header_value,
             raw_secret,
-        ))
+        }))
     }
 }
 

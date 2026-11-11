@@ -187,6 +187,13 @@ impl CommandVerifier {
         }
     }
 
+    /// Returns a monotonically non-decreasing epoch millisecond timestamp anchored
+    /// to the underlying [`ReplayFilter`]'s `Instant`.
+    #[must_use]
+    pub fn monotonic_now_ms(&self) -> u64 {
+        self.replay_filter.monotonic_now_ms()
+    }
+
     /// Verifies `envelope` against `authenticated_guest_cid` and `now_ms`,
     /// burning its nonce and advancing the guest's sequence watermark.
     pub fn verify_and_accept<'a>(
@@ -199,6 +206,13 @@ impl CommandVerifier {
             return Err(IpcError::GuestCidMismatch {
                 expected: authenticated_guest_cid,
                 actual: envelope.guest_cid,
+            });
+        }
+        if !(crate::transport::MIN_GUEST_VSOCK_CID..=crate::transport::MAX_GUEST_VSOCK_CID)
+            .contains(&envelope.guest_cid)
+        {
+            return Err(IpcError::UnauthorizedPeer {
+                detail: format!("guest cid {} is reserved", envelope.guest_cid),
             });
         }
 
@@ -218,6 +232,12 @@ impl CommandVerifier {
         );
         if verify_slices_are_equal(&expected_sig, &envelope.hardware_signature).is_err() {
             return Err(IpcError::SignatureVerificationFailed);
+        }
+
+        if envelope.sequence_no == u64::MAX {
+            return Err(IpcError::SequenceExhausted {
+                guest_cid: envelope.guest_cid,
+            });
         }
 
         let mut seq_guard = self

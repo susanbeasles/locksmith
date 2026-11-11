@@ -10,6 +10,13 @@ use crate::frame::{read_bounded_frame, write_bounded_frame, WireFrame};
 
 /// Minimum hypervisor-assignable guest CID (`0=hypervisor`, `1=local`, `2=host`).
 pub const MIN_GUEST_VSOCK_CID: u32 = 3;
+/// Maximum hypervisor-assignable guest CID (`u32::MAX` is reserved `VMADDR_CID_ANY`).
+pub const MAX_GUEST_VSOCK_CID: u32 = u32::MAX - 1;
+
+#[inline]
+fn is_assignable_guest_cid(cid: u32) -> bool {
+    (MIN_GUEST_VSOCK_CID..=MAX_GUEST_VSOCK_CID).contains(&cid)
+}
 
 /// Kernel-verified identity of a connected Ring 2 peer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,21 +59,25 @@ impl PeerAllowlist {
         Self::default()
     }
 
-    /// Permits a microVM guest CID (`>= 3`) over `AF_VSOCK`.
+    /// Permits a microVM guest CID (`3..=u32::MAX - 1`) over `AF_VSOCK`.
     pub fn allow_vsock_cid(&mut self, guest_cid: u32) {
-        if guest_cid >= MIN_GUEST_VSOCK_CID {
+        if is_assignable_guest_cid(guest_cid) {
             self.vsock_cids.insert(guest_cid);
         }
     }
 
-    /// Permits a local Unix UID over `AF_UNIX` and maps it to `mapped_guest_cid`.
+    /// Permits a local Unix UID over `AF_UNIX` and maps it to an assignable
+    /// `mapped_guest_cid` (`3..=u32::MAX - 1`). Reserved CIDs (`0..=2` and
+    /// `VMADDR_CID_ANY`) are refused.
     pub fn allow_unix_uid(&mut self, uid: u32, mapped_guest_cid: u32) {
-        self.unix_uid_to_cid.insert(uid, mapped_guest_cid);
+        if is_assignable_guest_cid(mapped_guest_cid) {
+            self.unix_uid_to_cid.insert(uid, mapped_guest_cid);
+        }
     }
 
     /// Validates an `AF_VSOCK` peer CID against the allowlist.
     pub fn verify_vsock_peer(&self, cid: u32, port: u32) -> Result<VerifiedPeerIdentity, IpcError> {
-        if cid < MIN_GUEST_VSOCK_CID || !self.vsock_cids.contains(&cid) {
+        if !is_assignable_guest_cid(cid) || !self.vsock_cids.contains(&cid) {
             return Err(IpcError::UnauthorizedPeer {
                 detail: format!("vsock cid {cid} not in allowlist"),
             });
@@ -86,6 +97,11 @@ impl PeerAllowlist {
                 detail: format!("unix uid {uid} not in allowlist"),
             });
         };
+        if !is_assignable_guest_cid(mapped_guest_cid) {
+            return Err(IpcError::UnauthorizedPeer {
+                detail: format!("mapped guest cid {mapped_guest_cid} is reserved"),
+            });
+        }
         Ok(VerifiedPeerIdentity::Unix {
             uid,
             gid,
@@ -110,10 +126,42 @@ pub struct UnixIpcListener {
 }
 
 impl UnixIpcListener {
-    /// Binds a new Unix Domain Socket listener at `socket_path`.
+    /// Binds a new Unix Domain Socket listener at `socket_path` and enforces
+    /// strict `0600` owner-only socket permissions before accepting traffic.
     pub fn bind(socket_path: &Path, config: IpcServerConfig) -> Result<Self, IpcError> {
         let listener =
             UnixListener::bind(socket_path).map_err(|e| IpcError::IoError(e.to_string()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+            let harden_res = (|| -> Result<(), IpcError> {
+                std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| IpcError::IoError(e.to_string()))?;
+                let meta = std::fs::symlink_metadata(socket_path)
+                    .map_err(|e| IpcError::IoError(e.to_string()))?;
+                if !meta.file_type().is_socket() {
+                    return Err(IpcError::IoError(
+                        "bound Unix IPC path is not a socket".to_owned(),
+                    ));
+                }
+                let mode = meta.permissions().mode() & 0o777;
+                if mode != 0o600 {
+                    return Err(IpcError::IoError(format!(
+                        "failed to enforce 0600 mode on Unix IPC socket (got 0o{mode:o})"
+                    )));
+                }
+                Ok(())
+            })();
+
+            if let Err(err) = harden_res {
+                drop(listener);
+                let _ = std::fs::remove_file(socket_path);
+                return Err(err);
+            }
+        }
+
         Ok(Self { listener, config })
     }
 

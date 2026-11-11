@@ -8,6 +8,18 @@ use crate::error::CacheError;
 const MAX_RELATIVE_PATH_LEN: usize = 512;
 const STREAM_CHUNK_BYTES: usize = 16_384;
 
+/// Kernel file-sealing enforcement policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SealPolicy {
+    /// Fail closed (`CacheError::SealFailed`) on Linux if `memfd_create` or
+    /// `fcntl_add_seals` fails for any reason.
+    #[default]
+    RequireKernelMemfd,
+    /// Explicit opt-in fallback to a private verified `Arc<[u8]>` in RAM for
+    /// restricted test sandboxes where `memfd_create` is unavailable.
+    AllowUnsealedFallback,
+}
+
 #[derive(Debug)]
 enum SealedBacking {
     #[cfg(target_os = "linux")]
@@ -77,19 +89,29 @@ impl VerifiedReadOnlyBlob {
         }
     }
 
-    /// Reads a fresh byte vector from the sealed backing without advancing shared cursor state.
+    /// Reads a fresh byte vector from the sealed backing without advancing shared cursor state,
+    /// using fallible heap reservation so oversized blobs cannot abort on OOM.
     pub fn read_to_vec(&self) -> Result<Vec<u8>, CacheError> {
         match &self.backing {
             #[cfg(target_os = "linux")]
             SealedBacking::Memfd { fd, len, .. } => pread_exact_vec(fd, *len),
-            SealedBacking::Memory { bytes, .. } => Ok(bytes.to_vec()),
+            SealedBacking::Memory { bytes, .. } => {
+                let mut out = Vec::new();
+                out.try_reserve_exact(bytes.len())
+                    .map_err(|_| CacheError::IoError)?;
+                out.extend_from_slice(bytes);
+                Ok(out)
+            }
         }
     }
 }
 
 #[cfg(target_os = "linux")]
 fn pread_exact_vec(fd: &rustix::fd::OwnedFd, len: usize) -> Result<Vec<u8>, CacheError> {
-    let mut out = vec![0u8; len];
+    let mut out = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| CacheError::IoError)?;
+    out.resize(len, 0u8);
     let mut offset = 0usize;
     while offset < len {
         let pos_u64 = u64::try_from(offset).map_err(|_| CacheError::IoError)?;
@@ -133,6 +155,218 @@ pub fn validate_relative_cache_path(relative_path: &str) -> Result<(), CacheErro
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn open_anchor_root_dir(root_dir: &Path) -> Result<rustix::fd::OwnedFd, CacheError> {
+    use rustix::fs::{mkdirat, open, openat2, Mode, OFlags, ResolveFlags};
+    use rustix::io::Errno;
+
+    let root_fd = open(
+        root_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|err| match err {
+        Errno::LOOP | Errno::NOTDIR => CacheError::PathViolation,
+        Errno::NOENT => CacheError::NotFound,
+        _ => CacheError::IoError,
+    })?;
+
+    for sub in ["blobs", "index"] {
+        match mkdirat(&root_fd, sub, Mode::from_raw_mode(0o700)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(Errno::LOOP | Errno::ACCESS | Errno::PERM) => {
+                return Err(CacheError::PathViolation)
+            }
+            Err(_) => return Err(CacheError::IoError),
+        }
+        // Confirm subdirectory is a real directory strictly beneath root_fd (never a symlink/mount)
+        let _verified_sub = openat2(
+            &root_fd,
+            sub,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+        )
+        .map_err(|err| match err {
+            Errno::LOOP
+            | Errno::XDEV
+            | Errno::NOTDIR
+            | Errno::ACCESS
+            | Errno::PERM
+            | Errno::INVAL => CacheError::PathViolation,
+            _ => CacheError::IoError,
+        })?;
+    }
+
+    Ok(root_fd)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn open_confined_readonly_at(
+    root_fd: &rustix::fd::OwnedFd,
+    relative_path: &str,
+) -> Result<File, CacheError> {
+    use rustix::fs::{fstat, openat2, FileType, Mode, OFlags, ResolveFlags};
+    use rustix::io::Errno;
+
+    validate_relative_cache_path(relative_path)?;
+
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV;
+
+    let fd = match openat2(root_fd, relative_path, flags, Mode::empty(), resolve) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Err(CacheError::NotFound),
+        Err(
+            Errno::LOOP
+            | Errno::XDEV
+            | Errno::NOTDIR
+            | Errno::ACCESS
+            | Errno::PERM
+            | Errno::INVAL
+            | Errno::ISDIR,
+        ) => return Err(CacheError::PathViolation),
+        Err(_) => return Err(CacheError::IoError),
+    };
+
+    let st = fstat(&fd).map_err(|_| CacheError::IoError)?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Err(CacheError::PathViolation);
+    }
+
+    Ok(File::from(fd))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn write_confined_atomic_at(
+    root_fd: &rustix::fd::OwnedFd,
+    subdir: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<(), CacheError> {
+    use rustix::fs::{
+        fsync, openat2, renameat, renameat_with, statat, unlinkat, AtFlags, FileType, Mode, OFlags,
+        RenameFlags, ResolveFlags,
+    };
+    use rustix::io::Errno;
+
+    if subdir.contains('/') || filename.contains('/') {
+        return Err(CacheError::PathViolation);
+    }
+    validate_relative_cache_path(subdir)?;
+    validate_relative_cache_path(filename)?;
+
+    let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV;
+    let dir_fd = openat2(
+        root_fd,
+        subdir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        resolve,
+    )
+    .map_err(|err| match err {
+        Errno::LOOP | Errno::XDEV | Errno::NOTDIR | Errno::ACCESS | Errno::PERM | Errno::INVAL => {
+            CacheError::PathViolation
+        }
+        _ => CacheError::IoError,
+    })?;
+
+    // Reject pre-planted symlinks, directories, FIFOs, sockets, or device nodes before staging
+    match statat(&dir_fd, filename, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => {
+            if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+                return Err(CacheError::PathViolation);
+            }
+        }
+        Err(Errno::NOENT) => {}
+        Err(Errno::LOOP | Errno::ACCESS | Errno::PERM) => return Err(CacheError::PathViolation),
+        Err(_) => return Err(CacheError::IoError),
+    }
+
+    let mut entropy = [0u8; 12];
+    aws_lc_rs::rand::fill(&mut entropy).map_err(|_| CacheError::IoError)?;
+    let mut rand_hex = String::with_capacity(24);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in &entropy {
+        rand_hex.push(char::from(HEX[usize::from(b >> 4)]));
+        rand_hex.push(char::from(HEX[usize::from(b & 0x0F)]));
+    }
+    let tmp_name = format!("tmp-{rand_hex}-{filename}");
+    validate_relative_cache_path(&tmp_name)?;
+
+    let tmp_fd = openat2(
+        &dir_fd,
+        &tmp_name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(0o600),
+        resolve,
+    )
+    .map_err(|err| match err {
+        Errno::LOOP | Errno::XDEV | Errno::NOTDIR | Errno::ACCESS | Errno::PERM | Errno::INVAL => {
+            CacheError::PathViolation
+        }
+        _ => CacheError::IoError,
+    })?;
+
+    let write_res = (|| -> Result<(), CacheError> {
+        let mut written = 0usize;
+        while written < bytes.len() {
+            match rustix::io::write(&tmp_fd, &bytes[written..]) {
+                Ok(0) => return Err(CacheError::IoError),
+                Ok(n) => {
+                    written = written.checked_add(n).ok_or(CacheError::IoError)?;
+                }
+                Err(Errno::INTR) => {}
+                Err(_) => return Err(CacheError::IoError),
+            }
+        }
+        fsync(&tmp_fd).map_err(|_| CacheError::IoError)?;
+        Ok(())
+    })();
+
+    drop(tmp_fd);
+    if let Err(err) = write_res {
+        let _ = unlinkat(&dir_fd, &tmp_name, AtFlags::empty());
+        return Err(err);
+    }
+
+    // Attempt atomic NOREPLACE first; if regular file already exists, verify it is still a regular
+    // file (not a raced symlink/special node) before atomic replacement.
+    match renameat_with(
+        &dir_fd,
+        &tmp_name,
+        &dir_fd,
+        filename,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
+        Err(Errno::EXIST) => {
+            let st = match statat(&dir_fd, filename, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = unlinkat(&dir_fd, &tmp_name, AtFlags::empty());
+                    return Err(CacheError::IoError);
+                }
+            };
+            if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+                let _ = unlinkat(&dir_fd, &tmp_name, AtFlags::empty());
+                return Err(CacheError::PathViolation);
+            }
+            if renameat(&dir_fd, &tmp_name, &dir_fd, filename).is_err() {
+                let _ = unlinkat(&dir_fd, &tmp_name, AtFlags::empty());
+                return Err(CacheError::IoError);
+            }
+        }
+        Err(_) => {
+            let _ = unlinkat(&dir_fd, &tmp_name, AtFlags::empty());
+            return Err(CacheError::IoError);
+        }
+    }
+
+    let _ = fsync(&dir_fd);
+    Ok(())
+}
+
 /// Validates `relative_path` and opens it read-only strictly beneath `root_dir`
 /// (`openat2` with `BENEATH | NO_SYMLINKS | NO_XDEV` on Linux).
 pub fn open_confined_readonly(root_dir: &Path, relative_path: &str) -> Result<File, CacheError> {
@@ -140,36 +374,29 @@ pub fn open_confined_readonly(root_dir: &Path, relative_path: &str) -> Result<Fi
 
     #[cfg(target_os = "linux")]
     {
-        use rustix::fs::{open, openat2, Mode, OFlags, ResolveFlags};
+        use rustix::fs::{open, Mode, OFlags};
         use rustix::io::Errno;
 
         let root_fd = open(
             root_dir,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )
-        .map_err(|_| CacheError::IoError)?;
+        .map_err(|err| match err {
+            Errno::LOOP | Errno::NOTDIR => CacheError::PathViolation,
+            Errno::NOENT => CacheError::NotFound,
+            _ => CacheError::IoError,
+        })?;
 
-        let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-        let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV;
-
-        match openat2(&root_fd, relative_path, flags, Mode::empty(), resolve) {
-            Ok(fd) => Ok(File::from(fd)),
-            Err(Errno::NOENT) => Err(CacheError::NotFound),
-            Err(
-                Errno::LOOP
-                | Errno::XDEV
-                | Errno::NOTDIR
-                | Errno::ACCESS
-                | Errno::PERM
-                | Errno::INVAL,
-            ) => Err(CacheError::PathViolation),
-            Err(_) => Err(CacheError::IoError),
-        }
+        open_confined_readonly_at(&root_fd, relative_path)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let root_meta = std::fs::symlink_metadata(root_dir).map_err(|_| CacheError::IoError)?;
+        if root_meta.file_type().is_symlink() {
+            return Err(CacheError::PathViolation);
+        }
         let mut cursor = root_dir.to_path_buf();
         for segment in relative_path.split('/') {
             cursor.push(segment);
@@ -220,6 +447,9 @@ where
                 max: max_bytes,
             });
         }
+        collected
+            .try_reserve(read_n)
+            .map_err(|_| CacheError::IoError)?;
         collected.extend_from_slice(&chunk[..read_n]);
     }
 
@@ -238,9 +468,26 @@ where
 /// Copies at most `max_bytes` from `reader` into an anonymous `memfd`, applies
 /// all four kernel seals (`WRITE | SHRINK | GROW | SEAL`), computes `BLAKE3`
 /// over the sealed RAM bytes, and runs `verify_fn(len, &digest)` before returning.
+///
+/// Enforces [`SealPolicy::RequireKernelMemfd`] by default on Linux (failing closed
+/// if `memfd_create` or kernel sealing fails).
 pub fn seal_and_verify_reader<R, F>(
+    reader: R,
+    max_bytes: u64,
+    verify_fn: F,
+) -> Result<VerifiedReadOnlyBlob, CacheError>
+where
+    R: Read,
+    F: FnOnce(u64, &[u8; 32]) -> Result<(), CacheError>,
+{
+    seal_and_verify_reader_with_policy(reader, max_bytes, SealPolicy::RequireKernelMemfd, verify_fn)
+}
+
+/// Copies at most `max_bytes` from `reader` under an explicit [`SealPolicy`].
+pub fn seal_and_verify_reader_with_policy<R, F>(
     mut reader: R,
     max_bytes: u64,
+    policy: SealPolicy,
     verify_fn: F,
 ) -> Result<VerifiedReadOnlyBlob, CacheError>
 where
@@ -325,13 +572,16 @@ where
                     },
                 })
             }
-            Err(Errno::NOSYS | Errno::PERM) => seal_in_arc_memory(reader, max_bytes, verify_fn),
+            Err(Errno::NOSYS | Errno::PERM) if policy == SealPolicy::AllowUnsealedFallback => {
+                seal_in_arc_memory(reader, max_bytes, verify_fn)
+            }
             Err(_) => Err(CacheError::SealFailed),
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = policy;
         seal_in_arc_memory(reader, max_bytes, verify_fn)
     }
 }
@@ -356,6 +606,9 @@ mod tests {
             }
         })
         .unwrap();
+
+        #[cfg(target_os = "linux")]
+        assert!(blob.is_kernel_sealed());
 
         assert_eq!(blob.len(), data.len());
         assert_eq!(blob.content_digest(), &expected_hash);

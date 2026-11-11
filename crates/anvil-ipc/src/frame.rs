@@ -129,8 +129,12 @@ where
             .map_err(map_read_error)?;
 
         let (msg_type, payload_len) = parse_frame_header(&header)?;
-        let mut payload = vec![0u8; payload_len];
+        let mut payload = Vec::new();
         if payload_len > 0 {
+            payload
+                .try_reserve_exact(payload_len)
+                .map_err(|e| IpcError::IoError(format!("frame allocation failed: {e}")))?;
+            payload.resize(payload_len, 0u8);
             reader
                 .read_exact(&mut payload)
                 .await

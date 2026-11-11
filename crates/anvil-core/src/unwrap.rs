@@ -16,6 +16,12 @@ pub const ENVELOPE_VERSION_V1: u8 = 1;
 /// Maximum permitted length for a `secret_id` identifier.
 pub const MAX_SECRET_ID_BYTES: usize = 256;
 
+/// Hard upper bound on `SealedSecretEnvelope::ciphertext_and_tag` (`64 KiB`).
+pub const MAX_ENVELOPE_CIPHERTEXT_BYTES: usize = 65_536;
+
+/// Normative hardware challenge IKM label per `SPEC.md` Section 2.3.
+pub const HW_CHALLENGE_IKM: &[u8] = b"LOCKSMITH-CHALLENGE";
+
 /// Zeroizing plaintext secret wrapper whose `Debug` and `Display` output are
 /// unconditionally redacted.
 pub struct SecretBytes(Zeroizing<Vec<u8>>);
@@ -193,7 +199,7 @@ impl SealedSecretEnvelope {
         let ct_len = usize::try_from(u32::from_be_bytes(len_bytes))
             .map_err(|_| CryptoError::InvalidEnvelopeFormat)?;
 
-        if ct_len < CHACHA20_POLY1305.tag_len() {
+        if ct_len < CHACHA20_POLY1305.tag_len() || ct_len > MAX_ENVELOPE_CIPHERTEXT_BYTES {
             return Err(CryptoError::InvalidEnvelopeFormat);
         }
         let expected_total = Self::HEADER_LEN
@@ -237,7 +243,7 @@ impl<H: HardwareUnwrapper> SecretUnwrapper<H> {
         let aad_digest = digest(&SHA256, aad_bytes);
         let challenge = derive_subkey(
             hkdf_salt,
-            b"LOCKSMITH-HW-CHALLENGE-V1",
+            HW_CHALLENGE_IKM,
             &[
                 DOMAIN_UNWRAP_HW_CHALLENGE,
                 hkdf_salt.as_slice(),
@@ -269,6 +275,14 @@ impl<H: HardwareUnwrapper> SecretUnwrapper<H> {
         plaintext: &[u8],
         aad: &UnwrapAad<'_>,
     ) -> Result<SealedSecretEnvelope, CryptoError> {
+        let total_ct_len = plaintext
+            .len()
+            .checked_add(CHACHA20_POLY1305.tag_len())
+            .ok_or(CryptoError::InvalidEnvelopeFormat)?;
+        if total_ct_len > MAX_ENVELOPE_CIPHERTEXT_BYTES {
+            return Err(CryptoError::InvalidEnvelopeFormat);
+        }
+
         let aad_bytes = aad.encode_canonical()?;
 
         let mut hkdf_salt = [0u8; 32];
@@ -282,8 +296,7 @@ impl<H: HardwareUnwrapper> SecretUnwrapper<H> {
             .map_err(|_| CryptoError::KeyDerivationFailed)?;
         let aead_key = LessSafeKey::new(unbound);
 
-        let mut ciphertext_and_tag =
-            Vec::with_capacity(plaintext.len() + CHACHA20_POLY1305.tag_len());
+        let mut ciphertext_and_tag = Vec::with_capacity(total_ct_len);
         ciphertext_and_tag.extend_from_slice(plaintext);
 
         aead_key
@@ -310,6 +323,9 @@ impl<H: HardwareUnwrapper> SecretUnwrapper<H> {
     ) -> Result<SecretBytes, CryptoError> {
         if envelope.version != ENVELOPE_VERSION_V1 {
             return Err(CryptoError::UnsupportedEnvelopeVersion(envelope.version));
+        }
+        if envelope.ciphertext_and_tag.len() > MAX_ENVELOPE_CIPHERTEXT_BYTES {
+            return Err(CryptoError::InvalidEnvelopeFormat);
         }
         if envelope.ciphertext_and_tag.len() < CHACHA20_POLY1305.tag_len() {
             return Err(CryptoError::AuthenticationFailed);

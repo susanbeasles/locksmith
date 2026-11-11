@@ -187,3 +187,139 @@ async fn redteam_unauthorized_peer_cid_and_uid_dropped_before_handler() {
 
     let _ = std::fs::remove_file(&sock_path);
 }
+
+#[cfg(target_os = "linux")]
+fn current_rss_kib() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let digits = rest.split_whitespace().next().unwrap_or("0");
+            return digits.parse::<u64>().unwrap_or(0);
+        }
+    }
+    0
+}
+
+#[tokio::test]
+async fn redteam_socket_permissions_0600_reserved_cid_and_command_verifier_hardening() {
+    use anvil_core::replay::ReplayFilter;
+    use anvil_ipc::{AttestedCommandEnvelope, CommandVerifier};
+    use std::os::unix::fs::PermissionsExt;
+
+    // 1. UnixIpcListener::bind MUST enforce 0600 owner-only socket mode
+    let sock_path = fresh_socket_path("perm0600");
+    let listener = UnixIpcListener::bind(
+        &sock_path,
+        IpcServerConfig {
+            frame_read_deadline: Duration::from_millis(500),
+            allowlist: PeerAllowlist::new(),
+        },
+    )
+    .unwrap();
+    let mode = std::fs::symlink_metadata(&sock_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "UnixIpcListener socket permissions must be strictly 0600 (got 0o{mode:o})"
+    );
+    drop(listener);
+    let _ = std::fs::remove_file(&sock_path);
+
+    // 2. PeerAllowlist MUST refuse mapping any Unix UID to reserved CIDs 0, 1, or 2
+    for reserved_cid in [0u32, 1, 2] {
+        let mut allow = PeerAllowlist::new();
+        allow.allow_unix_uid(1000, reserved_cid);
+        assert!(
+            matches!(
+                allow.verify_unix_peer(1000, 1000, Some(42)),
+                Err(IpcError::UnauthorizedPeer { .. })
+            ),
+            "reserved CID {reserved_cid} must never be authorized via Unix UID mapping"
+        );
+    }
+
+    // 3. CommandVerifier adversarial matrix: u64::MAX exhaustion, signature bit-flip, CID spoof, replay
+    let root_key = [0x91; 32];
+    let replay = Arc::new(ReplayFilter::with_defaults(256).unwrap());
+    let verifier = CommandVerifier::new(root_key, replay);
+    let now_ms = 1_762_000_000_000u64;
+
+    let max_seq_env = AttestedCommandEnvelope::sign_new(
+        &root_key,
+        9,
+        u64::MAX,
+        now_ms,
+        [0x01; 32],
+        b"exhaust".to_vec(),
+    );
+    if let Ok(env) = max_seq_env {
+        assert!(
+            verifier.verify_and_accept(&env, 9, now_ms).is_err(),
+            "sequence_no == u64::MAX must be rejected before poisoning sequence state"
+        );
+    }
+
+    let valid_env =
+        AttestedCommandEnvelope::sign_new(&root_key, 9, 10, now_ms, [0x02; 32], b"status".to_vec())
+            .unwrap();
+    assert_eq!(
+        verifier
+            .verify_and_accept(&valid_env, 10, now_ms)
+            .unwrap_err(),
+        IpcError::GuestCidMismatch {
+            expected: 10,
+            actual: 9
+        }
+    );
+
+    let mut sig_flipped = valid_env.clone();
+    sig_flipped.hardware_signature[15] ^= 0x01;
+    assert_eq!(
+        verifier
+            .verify_and_accept(&sig_flipped, 9, now_ms)
+            .unwrap_err(),
+        IpcError::SignatureVerificationFailed
+    );
+
+    assert_eq!(
+        verifier.verify_and_accept(&valid_env, 9, now_ms).unwrap(),
+        b"status"
+    );
+    // Out-of-order sequence (seq 9 < 10) rejected
+    let out_of_order =
+        AttestedCommandEnvelope::sign_new(&root_key, 9, 9, now_ms, [0x03; 32], b"rewind".to_vec())
+            .unwrap();
+    assert!(matches!(
+        verifier
+            .verify_and_accept(&out_of_order, 9, now_ms)
+            .unwrap_err(),
+        IpcError::SequenceViolation {
+            last_seen: Some(10),
+            actual: 9
+        }
+    ));
+
+    // 4. Verify 500 x 4 GiB frame bombs cause negligible RSS delta (< 16 MiB vs 2 TiB)
+    #[cfg(target_os = "linux")]
+    {
+        let rss_before = current_rss_kib();
+        let bomb_header: [u8; 10] = [b'L', b'K', b'S', b'M', 1, 1, 0xFF, 0xFF, 0xFF, 0xFF];
+        for _ in 0..500 {
+            let (mut tx, mut rx) = tokio::io::duplex(64);
+            tx.write_all(&bomb_header).await.unwrap();
+            let err = read_bounded_frame(&mut rx, Duration::from_millis(100))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, IpcError::FrameTooLarge { .. }));
+        }
+        let rss_after = current_rss_kib();
+        let delta_kib = rss_after.saturating_sub(rss_before);
+        assert!(
+            delta_kib < 16_384,
+            "500 x 4 GiB frame bombs must not grow RSS (delta={delta_kib} KiB)"
+        );
+    }
+}

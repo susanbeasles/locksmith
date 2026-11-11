@@ -8,7 +8,9 @@ use zeroize::Zeroizing;
 
 use crate::error::CacheError;
 use crate::sanitize::validate_metadata_str;
-use crate::seal::{open_confined_readonly, seal_and_verify_reader, VerifiedReadOnlyBlob};
+#[cfg(not(target_os = "linux"))]
+use crate::seal::open_confined_readonly;
+use crate::seal::{seal_and_verify_reader, VerifiedReadOnlyBlob};
 
 const META_MAGIC: &[u8; 4] = b"LKCM";
 const META_FORMAT_VERSION: u8 = 1;
@@ -211,23 +213,49 @@ fn parse_index_record(bytes: &[u8]) -> Result<ParsedIndexRecord, CacheError> {
 }
 
 /// Hostile-transport content-addressed cache store enforcing keyed `BLAKE3` MAC
-/// verification, `openat2` path confinement, and `memfd` sealing.
+/// verification, anchored `openat2` path confinement, and `memfd` sealing.
 pub struct CacheStore {
     config: CacheStoreConfig,
     mac_key: Zeroizing<[u8; 32]>,
+    #[cfg(target_os = "linux")]
+    root_fd: rustix::fd::OwnedFd,
 }
 
 impl CacheStore {
-    /// Initializes a [`CacheStore`], deriving a domain-separated `BLAKE3` MAC
-    /// key from `master_key` via `anvil-core` canonical HKDF.
+    /// Initializes a [`CacheStore`], anchoring a persistent directory descriptor on
+    /// `config.root_dir` and deriving a domain-separated `BLAKE3` MAC key from
+    /// `master_key` via `anvil-core` canonical HKDF.
     pub fn new(config: CacheStoreConfig, master_key: &[u8; 32]) -> Result<Self, CacheError> {
         validate_metadata_str(&config.namespace)?;
         if config.max_blob_bytes == 0 {
             return Err(CacheError::CorruptRecordFormat);
         }
 
-        std::fs::create_dir_all(config.root_dir.join("blobs")).map_err(|_| CacheError::IoError)?;
-        std::fs::create_dir_all(config.root_dir.join("index")).map_err(|_| CacheError::IoError)?;
+        if std::fs::symlink_metadata(&config.root_dir).is_err() {
+            std::fs::create_dir_all(&config.root_dir).map_err(|_| CacheError::IoError)?;
+        }
+
+        #[cfg(target_os = "linux")]
+        let root_fd = crate::seal::open_anchor_root_dir(&config.root_dir)?;
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let root_meta =
+                std::fs::symlink_metadata(&config.root_dir).map_err(|_| CacheError::IoError)?;
+            if root_meta.file_type().is_symlink() {
+                return Err(CacheError::PathViolation);
+            }
+            for sub in ["blobs", "index"] {
+                let p = config.root_dir.join(sub);
+                if std::fs::symlink_metadata(&p).is_err() {
+                    std::fs::create_dir(&p).map_err(|_| CacheError::IoError)?;
+                }
+                let sub_meta = std::fs::symlink_metadata(&p).map_err(|_| CacheError::IoError)?;
+                if sub_meta.file_type().is_symlink() || !sub_meta.is_dir() {
+                    return Err(CacheError::PathViolation);
+                }
+            }
+        }
 
         let mac_key = derive_subkey(
             b"LOCKSMITH-ANVIL-CACHE-SALT-V1",
@@ -236,7 +264,12 @@ impl CacheStore {
         )
         .map_err(|_| CacheError::IntegrityMismatch)?;
 
-        Ok(Self { config, mac_key })
+        Ok(Self {
+            config,
+            mac_key,
+            #[cfg(target_os = "linux")]
+            root_fd,
+        })
     }
 
     /// Returns the cache root directory path.
@@ -245,8 +278,9 @@ impl CacheStore {
         &self.config.root_dir
     }
 
-    /// Sanitizes `metadata`, writes the content-addressed blob, and writes a
-    /// keyed `BLAKE3` MAC index record binding `(logical_key, schema_version, content_len, blake3_root)`.
+    /// Sanitizes `metadata`, writes the content-addressed `<hex>.blob` via confined
+    /// atomic `openat2` staging, and writes a keyed `BLAKE3` MAC `<hex>.entry` index record
+    /// binding `(logical_key, schema_version, content_len, blake3_root)`.
     pub fn put(
         &self,
         logical_key: &str,
@@ -278,54 +312,82 @@ impl CacheStore {
         )?;
 
         let blob_hex = hex_encode_32(&blake3_root);
-        let blob_path = self
-            .config
-            .root_dir
-            .join("blobs")
-            .join(format!("{blob_hex}.blob"));
-        std::fs::write(&blob_path, payload).map_err(|_| CacheError::IoError)?;
+        let blob_filename = format!("{blob_hex}.blob");
 
         let key_id = *blake3::hash(logical_key.as_bytes()).as_bytes();
         let key_hex = hex_encode_32(&key_id);
-        let meta_bytes = serialize_index_record(
+        let entry_filename = format!("{key_hex}.entry");
+        let entry_bytes = serialize_index_record(
             self.config.schema_version,
             content_len,
             &blake3_root,
             &mac,
             metadata,
         )?;
-        let meta_path = self
-            .config
-            .root_dir
-            .join("index")
-            .join(format!("{key_hex}.meta"));
-        std::fs::write(&meta_path, &meta_bytes).map_err(|_| CacheError::IoError)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            // Validate index destination has no planted symlink BEFORE writing blob or entry
+            crate::seal::write_confined_atomic_at(&self.root_fd, "blobs", &blob_filename, payload)?;
+            crate::seal::write_confined_atomic_at(
+                &self.root_fd,
+                "index",
+                &entry_filename,
+                &entry_bytes,
+            )?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            for (sub, fname, data) in [
+                ("blobs", blob_filename.as_str(), payload),
+                ("index", entry_filename.as_str(), entry_bytes.as_slice()),
+            ] {
+                let sub_path = self.config.root_dir.join(sub);
+                let sub_meta =
+                    std::fs::symlink_metadata(&sub_path).map_err(|_| CacheError::IoError)?;
+                if sub_meta.file_type().is_symlink() {
+                    return Err(CacheError::PathViolation);
+                }
+                let full_path = sub_path.join(fname);
+                if let Ok(m) = std::fs::symlink_metadata(&full_path) {
+                    if m.file_type().is_symlink() || !m.is_file() {
+                        return Err(CacheError::PathViolation);
+                    }
+                }
+                std::fs::write(&full_path, data).map_err(|_| CacheError::IoError)?;
+            }
+        }
 
         Ok(blake3_root)
     }
 
-    /// Opens the cached entry strictly beneath `root_dir`, copies into an
-    /// anonymous sealed `memfd`, and verifies both the content `BLAKE3` root
-    /// and keyed `BLAKE3` MAC before returning [`CacheHit`].
+    /// Opens the cached `<hex>.entry` and `<hex>.blob` strictly beneath the anchored
+    /// `root_fd`, copies into a kernel-sealed `memfd`, and verifies both the content
+    /// `BLAKE3` root and keyed `BLAKE3` MAC before returning [`CacheHit`].
     pub fn get(&self, logical_key: &str) -> Result<CacheHit, CacheError> {
         validate_logical_key(logical_key)?;
 
         let key_id = *blake3::hash(logical_key.as_bytes()).as_bytes();
         let key_hex = hex_encode_32(&key_id);
-        let rel_meta = format!("index/{key_hex}.meta");
+        let rel_entry = format!("index/{key_hex}.entry");
 
-        let mut meta_file = open_confined_readonly(&self.config.root_dir, &rel_meta)?;
-        let mut raw_meta = Vec::new();
-        meta_file
+        #[cfg(target_os = "linux")]
+        let mut entry_file = crate::seal::open_confined_readonly_at(&self.root_fd, &rel_entry)?;
+        #[cfg(not(target_os = "linux"))]
+        let mut entry_file = open_confined_readonly(&self.config.root_dir, &rel_entry)?;
+
+        let mut raw_entry = Vec::new();
+        entry_file
             .by_ref()
             .take((MAX_META_FILE_BYTES + 1) as u64)
-            .read_to_end(&mut raw_meta)
+            .read_to_end(&mut raw_entry)
             .map_err(|_| CacheError::IoError)?;
-        if raw_meta.len() > MAX_META_FILE_BYTES {
+        if raw_entry.len() > MAX_META_FILE_BYTES {
             return Err(CacheError::CorruptRecordFormat);
         }
 
-        let record = parse_index_record(&raw_meta)?;
+        let record = parse_index_record(&raw_entry)?;
         if record.schema_version != self.config.schema_version {
             return Err(CacheError::SchemaVersionMismatch {
                 expected: self.config.schema_version,
@@ -341,6 +403,10 @@ impl CacheStore {
 
         let blob_hex = hex_encode_32(&record.blake3_root);
         let rel_blob = format!("blobs/{blob_hex}.blob");
+
+        #[cfg(target_os = "linux")]
+        let blob_file = crate::seal::open_confined_readonly_at(&self.root_fd, &rel_blob)?;
+        #[cfg(not(target_os = "linux"))]
         let blob_file = open_confined_readonly(&self.config.root_dir, &rel_blob)?;
 
         let expected_root = record.blake3_root;
@@ -375,20 +441,16 @@ impl CacheStore {
             },
         )?;
 
+        #[cfg(target_os = "linux")]
+        if !sealed_blob.is_kernel_sealed() {
+            return Err(CacheError::SealFailed);
+        }
+
         Ok(CacheHit {
             blob: sealed_blob,
             metadata: record.metadata,
             schema_version,
         })
-    }
-
-    /// Opens an arbitrary relative cache sub-path using confined `openat2` rules.
-    pub fn get_confined_raw(
-        &self,
-        relative_path: &str,
-    ) -> Result<VerifiedReadOnlyBlob, CacheError> {
-        let file = open_confined_readonly(&self.config.root_dir, relative_path)?;
-        seal_and_verify_reader(file, self.config.max_blob_bytes, |_, _| Ok(()))
     }
 }
 
