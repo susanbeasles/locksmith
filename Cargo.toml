@@ -4,6 +4,7 @@ members = [
     "crates/anvil-core",
     "crates/anvil-cache",
     "crates/anvil-ipc",
+    "crates/locksmith-proxy",
 ]
 
 [workspace.package]
